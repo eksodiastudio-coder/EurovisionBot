@@ -3,6 +3,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import uuid
+import traceback
 from flask import Flask
 from threading import Thread
 
@@ -43,7 +44,6 @@ def is_staff():
         member = interaction.guild.get_member(interaction.user.id)
         if not member:
             return False
-        # Allows access if the user has either the Staff role OR the HR role
         return any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles)
     return app_commands.check(predicate)
 
@@ -184,7 +184,6 @@ class PollBoardView(discord.ui.View):
 
         if interaction.guild:
             member = interaction.guild.get_member(interaction.user.id)
-            # Prevent Staff and HR members from voting as public members
             if member and any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
                 await interaction.response.send_message(
                     "❌ **Staff/HR Members Cannot Vote Here**: As a member of the Staff or HR team, you will cast your votes during the Live Staff Voting phase instead.", 
@@ -233,7 +232,6 @@ class StaffBoardView(discord.ui.View):
 
         if interaction.guild:
             member = interaction.guild.get_member(interaction.user.id)
-            # Require Staff or HR role to access the staff live voting
             if not member or not any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
                 await interaction.response.send_message(
                     "❌ **Permission Denied**: This option is restricted to server Staff and HR.", 
@@ -266,16 +264,12 @@ class CandidateSelect(discord.ui.Select):
         super().__init__(placeholder="Select a candidate to assign points...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        await self.view.handle_candidate_selection(interaction, self.values[0])
-
-class PointSelect(discord.ui.Select):
-    def __init__(self, candidate, available_points):
-        self.candidate_name = candidate
-        options = [discord.SelectOption(label=f"{p} points", value=str(p)) for p in available_points]
-        super().__init__(placeholder=f"Select points for {candidate}...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        await self.view.handle_point_selection(interaction, self.candidate_name, int(self.values[0]))
+        try:
+            await self.view.handle_candidate_selection(interaction, self.values[0])
+        except Exception as e:
+            print(f"[Error] CandidateSelect Callback: {e}")
+            traceback.print_exc()
+            await interaction.response.send_message(f"❌ An error occurred during selection: {e}", ephemeral=True)
 
 class ResetButton(discord.ui.Button):
     def __init__(self):
@@ -342,7 +336,12 @@ class StaffCandidateSelect(discord.ui.Select):
         super().__init__(placeholder="Select a candidate to award points...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        await self.view.handle_candidate_selection(interaction, self.values[0])
+        try:
+            await self.view.handle_candidate_selection(interaction, self.values[0])
+        except Exception as e:
+            print(f"[Error] StaffCandidateSelect Callback: {e}")
+            traceback.print_exc()
+            await interaction.response.send_message(f"❌ An error occurred during selection: {e}", ephemeral=True)
 
 class StaffPointSelect(discord.ui.Select):
     def __init__(self, candidate, available_points):
@@ -351,7 +350,12 @@ class StaffPointSelect(discord.ui.Select):
         super().__init__(placeholder=f"Select points for {candidate}...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        await self.view.handle_point_selection(interaction, self.candidate_name, int(self.values[0]))
+        try:
+            await self.view.handle_point_selection(interaction, self.candidate_name, int(self.values[0]))
+        except Exception as e:
+            print(f"[Error] StaffPointSelect Callback: {e}")
+            traceback.print_exc()
+            await interaction.response.send_message(f"❌ An error occurred during point assignment: {e}", ephemeral=True)
 
 class StaffVotingView(discord.ui.View):
     def __init__(self, poll_id, user_id, bot_instance):
@@ -373,7 +377,7 @@ class StaffVotingView(discord.ui.View):
 
     async def handle_candidate_selection(self, interaction: discord.Interaction, candidate: str):
         self.clear_items()
-        self.add_item(StaffPointSelect(self.available_points))
+        self.add_item(StaffPointSelect(candidate, self.available_points))
         await interaction.response.edit_message(content=f"Awarding points to **{candidate}**.\nSelect the points value:", view=self)
 
     async def handle_point_selection(self, interaction: discord.Interaction, candidate: str, points: int):
