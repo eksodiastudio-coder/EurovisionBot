@@ -7,7 +7,9 @@ from flask import Flask
 from threading import Thread
 
 # --- CONFIGURATION ---
-STAFF_ROLE_ID = 1411815663462519006  
+STAFF_ROLE_ID = 1449084902539657288  
+HR_ROLE_ID = 1460385491261194464  # <-- Replace with your actual server HR Role ID
+
 EUROVISION_POINTS = [12, 10, 8, 7, 6, 5, 4, 3, 2, 1]
 
 class EurovisionBot(commands.Bot):
@@ -23,7 +25,7 @@ class EurovisionBot(commands.Bot):
         async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
             if isinstance(error, app_commands.errors.CheckFailure):
                 await interaction.response.send_message(
-                    "❌ **Permission Denied**: This command can only be used by server Staff.", 
+                    "❌ **Permission Denied**: This command can only be used by server Staff or HR.", 
                     ephemeral=True
                 )
             else:
@@ -41,7 +43,8 @@ def is_staff():
         member = interaction.guild.get_member(interaction.user.id)
         if not member:
             return False
-        return any(role.id == STAFF_ROLE_ID for role in member.roles)
+        # Allows access if the user has either the Staff role OR the HR role
+        return any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles)
     return app_commands.check(predicate)
 
 def get_initial_points(candidate_count):
@@ -181,9 +184,10 @@ class PollBoardView(discord.ui.View):
 
         if interaction.guild:
             member = interaction.guild.get_member(interaction.user.id)
-            if member and any(role.id == STAFF_ROLE_ID for role in member.roles):
+            # Prevent Staff and HR members from voting as public members
+            if member and any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
                 await interaction.response.send_message(
-                    "❌ **Staff Members Cannot Vote Here**: As a member of the Staff team, you will cast your votes during the Live Staff Voting phase instead.", 
+                    "❌ **Staff/HR Members Cannot Vote Here**: As a member of the Staff or HR team, you will cast your votes during the Live Staff Voting phase instead.", 
                     ephemeral=True
                 )
                 return
@@ -229,9 +233,10 @@ class StaffBoardView(discord.ui.View):
 
         if interaction.guild:
             member = interaction.guild.get_member(interaction.user.id)
-            if not member or not any(role.id == STAFF_ROLE_ID for role in member.roles):
+            # Require Staff or HR role to access the staff live voting
+            if not member or not any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
                 await interaction.response.send_message(
-                    "❌ **Permission Denied**: This option is restricted to server Staff.", 
+                    "❌ **Permission Denied**: This option is restricted to server Staff and HR.", 
                     ephemeral=True
                 )
                 return
@@ -510,7 +515,6 @@ def keep_alive():
 if __name__ == "__main__":
     keep_alive()  # Start the web server
     
-    # Securely retrieve the Discord token from the environment variables
     token = os.environ.get("DISCORD_TOKEN")
     if token:
         bot.run(token)
