@@ -3,3 +3,4 @@ PyNaCl
 google-genai
 Flask
 gunicorn
+edge-tts
