@@ -6,10 +6,9 @@ from threading import Thread
 from flask import Flask
 
 import discord
+import wave
 from discord import app_commands
 from discord.ext import commands
-import edge_tts
-import wave
 from google.genai import types
 
 # --- Google GenAI SDK ---
