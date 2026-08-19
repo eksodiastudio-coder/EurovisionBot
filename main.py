@@ -8,7 +8,7 @@ from flask import Flask
 import discord
 from discord import app_commands
 from discord.ext import commands
-from gtts import gTTS
+import edge_tts
 
 # --- Google GenAI SDK ---
 from google import genai
@@ -102,22 +102,38 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
     return embed
 
 
-# --- AUDIO HELPER ---
+# --- HIGH-ENERGY AI VOICE HELPER ---
+
+# Available Announcer Voices you can pick:
+# 1. "en-US-GuyNeural"         -> Energetic American Game Show / TV Host (Recommended!)
+# 2. "en-GB-RyanNeural"        -> Charismatic British Eurovision Broadcaster
+# 3. "en-US-ChristopherNeural" -> Confident Radio Host / Announcer
+# 4. "en-AU-WilliamNeural"     -> Upbeat Australian Presenter
+
+ANNOUNCER_VOICE = "en-US-GuyNeural"
 
 async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
-    """Generates audio from text and streams it in the voice channel."""
+    """Generates expressive, high-energy neural audio and plays it in voice."""
     if not text.strip():
         return
+        
     temp_file = f"tts_{uuid.uuid4().hex[:6]}.mp3"
     try:
-        tts = gTTS(text=text, lang="en", tld="com")
-        tts.save(temp_file)
+        # rate="+10%" makes the delivery punchy and fast-paced
+        # pitch="+4Hz" raises vocal excitement slightly like a real presenter
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=ANNOUNCER_VOICE,
+            rate="+10%",
+            pitch="+4Hz"
+        )
+        await communicate.save(temp_file)
         
         audio_source = discord.FFmpegPCMAudio(temp_file)
         voice_client.play(audio_source)
         
         while voice_client.is_playing():
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
     except Exception as e:
         print(f"Error in TTS Playback: {e}")
     finally:
