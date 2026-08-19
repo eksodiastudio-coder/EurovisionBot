@@ -9,6 +9,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import edge_tts
+import wave
+from google.genai import types
 
 # --- Google GenAI SDK ---
 from google import genai
@@ -102,44 +104,59 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
     return embed
 
 
-# --- HIGH-ENERGY AI VOICE HELPER ---
-
-# Available Announcer Voices you can pick:
-# 1. "en-US-GuyNeural"         -> Energetic American Game Show / TV Host (Recommended!)
-# 2. "en-GB-RyanNeural"        -> Charismatic British Eurovision Broadcaster
-# 3. "en-US-ChristopherNeural" -> Confident Radio Host / Announcer
-# 4. "en-AU-WilliamNeural"     -> Upbeat Australian Presenter
-
-ANNOUNCER_VOICE = "en-GB-RyanNeural"
+# --- GEMINI NATIVE VOICE CONFIGURATION ---
+# Choose your favorite: "Achird", "Achernar", "Alnilam", "Fenrir", "Puck", "Aoede"
+GEMINI_VOICE_NAME = "Achird" 
 
 async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
-    """Generates expressive, high-energy neural audio and plays it in voice."""
-    if not text.strip():
+    """Generates audio natively from Gemini TTS using prebuilt voices."""
+    if not text.strip() or not ai_client:
         return
         
-    temp_file = f"tts_{uuid.uuid4().hex[:6]}.mp3"
+    temp_wav = f"gemini_tts_{uuid.uuid4().hex[:6]}.wav"
     try:
-        # rate="+10%" makes the delivery punchy and fast-paced
-        # pitch="+4Hz" raises vocal excitement slightly like a real presenter
-        communicate = edge_tts.Communicate(
-            text=text,
-            voice=ANNOUNCER_VOICE,
-            rate="+10%",
-            pitch="+4Hz"
+        # 1. Request Gemini to generate native audio using the selected voice
+        response = ai_client.models.generate_content(
+            model="gemini-3.1-flash-tts-preview", # or "gemini-2.5-flash"
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=GEMINI_VOICE_NAME
+                        )
+                    )
+                )
+            )
         )
-        await communicate.save(temp_file)
         
-        audio_source = discord.FFmpegPCMAudio(temp_file)
-        voice_client.play(audio_source)
-        
-        while voice_client.is_playing():
-            await asyncio.sleep(0.3)
+        # 2. Extract PCM audio bytes and save as standard 24kHz WAV
+        for part in response.candidates[0].content.parts:
+            if part.inline_data:
+                pcm_data = part.inline_data.data
+                with wave.open(temp_wav, "wb") as wf:
+                    wf.setnchannels(1)        # Mono
+                    wf.setsampwidth(2)        # 16-bit PCM
+                    wf.setframerate(24000)    # 24kHz Sample Rate
+                    wf.writeframes(pcm_data)
+                break
+
+        # 3. Stream the generated WAV audio to Discord Voice
+        if os.path.exists(temp_wav):
+            audio_source = discord.FFmpegPCMAudio(temp_wav)
+            voice_client.play(audio_source)
+            
+            while voice_client.is_playing():
+                await asyncio.sleep(0.3)
+                
     except Exception as e:
-        print(f"Error in TTS Playback: {e}")
+        print(f"Error in Gemini TTS audio playback: {e}")
+        traceback.print_exc()
     finally:
-        if os.path.exists(temp_file):
+        if os.path.exists(temp_wav):
             try:
-                os.remove(temp_file)
+                os.remove(temp_wav)
             except Exception:
                 pass
 
