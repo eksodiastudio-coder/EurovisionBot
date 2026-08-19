@@ -111,16 +111,15 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
 
 
 # --- GEMINI 3.1 FLASH TTS CONFIGURATION ---
-# Supported 3.1 Voices: "Achird", "Fenrir", "Puck", "Aoede", "Charon", "Kore", "Sadachbia", "Zephyr"
 GEMINI_VOICE_NAME = "Achird"
 TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
 
-async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
-    """Generates audio using Gemini 3.1 Flash TTS Preview with Achird."""
+async def synthesize_tts_file(text: str) -> str:
+    """Generates audio file asynchronously with Achird voice."""
     if not text.strip():
-        return
+        return None
         
-    temp_wav = f"gemini_tts_{uuid.uuid4().hex[:6]}.wav"
+    temp_wav = f"gemini_tts_{uuid.uuid4().hex}.wav"
     audio_generated = False
 
     if ai_client:
@@ -128,7 +127,8 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
         
         for model in TTS_MODELS:
             try:
-                response = ai_client.models.generate_content(
+                # Async call prevents blocking Discord.py event loop
+                response = await ai_client.aio.models.generate_content(
                     model=model,
                     contents=tagged_text,
                     config=types.GenerateContentConfig(
@@ -151,9 +151,9 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
                                 pcm_data = base64.b64decode(pcm_data)
                                 
                             with wave.open(temp_wav, "wb") as wf:
-                                wf.setnchannels(1)        # Mono
-                                wf.setsampwidth(2)        # 16-bit PCM
-                                wf.setframerate(24000)    # Gemini Native 24kHz
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(24000)
                                 wf.writeframes(pcm_data)
                                 
                             audio_generated = True
@@ -162,14 +162,11 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
                 if audio_generated:
                     break
             except Exception as e:
-                print(f"[Gemini 3.1 TTS ({model}) Error]: {e}")
-    else:
-        print("[Gemini 3.1 TTS Error]: GEMINI_API_KEY environment variable is not set.")
+                print(f"[Gemini 3.1 TTS ({model}) Warning]: {e}")
 
     # Fallback to Edge-TTS only if Gemini fails
     if not audio_generated or not os.path.exists(temp_wav):
         try:
-            print("[TTS Fallback]: Gemini TTS failed, using backup voice.")
             communicate = edge_tts.Communicate(
                 text=text,
                 voice="en-US-GuyNeural",
@@ -181,21 +178,22 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
         except Exception as e:
             print(f"[TTS Fallback Error]: {e}")
 
-    # Stream to Discord Voice Channel and wait for completion
-    if audio_generated and os.path.exists(temp_wav):
-        try:
-            audio_source = discord.FFmpegPCMAudio(temp_wav)
-            voice_client.play(audio_source)
-            
-            while voice_client.is_playing():
-                await asyncio.sleep(0.15)
-        except Exception as e:
-            print(f"Error streaming to voice channel: {e}")
-        finally:
-            try:
-                os.remove(temp_wav)
-            except Exception:
-                pass
+    return temp_wav if audio_generated and os.path.exists(temp_wav) else None
+
+
+async def play_audio_file(voice_client: discord.VoiceClient, filepath: str):
+    """Streams a pre-generated audio file to Discord voice without generation delay."""
+    if not filepath or not os.path.exists(filepath):
+        return
+        
+    try:
+        audio_source = discord.FFmpegPCMAudio(filepath)
+        voice_client.play(audio_source)
+        
+        while voice_client.is_playing():
+            await asyncio.sleep(0.08)
+    except Exception as e:
+        print(f"Error streaming to voice channel: {e}")
 
 
 # --- CANDIDATE SETUP UI ---
@@ -498,7 +496,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     
     poll_data = bot.polls[poll_id]
     poll_data["status"] = "live_show"
-    await interaction.response.send_message(f"🎙️ **Starting the Grand Final Live Broadcast in {voice_channel.mention}!**")
+    await interaction.response.send_message(f"🎙️ **Preparing the Grand Final Broadcast in {voice_channel.mention}...**")
 
     # Connect to Voice Channel
     try:
@@ -533,7 +531,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     winner_points = sorted_final[0][1] if sorted_final else 0
     runner_up = sorted_final[1][0] if len(sorted_final) > 1 else None
 
-    # --- 2. GENERATE A DEEP, DRAMATIC SCRIPT WITH GEMINI ---
+    # --- 2. GENERATE SCRIPT WITH ASYNC GEMINI ---
     prompt = f'''
 You are the charismatic, dramatic, and iconic Game Show and Eurovision Host for tonight's Grand Final!
 Event Name: {poll_data['title']}
@@ -573,7 +571,7 @@ Deliver an explosive, emotional climax.
     host_script = ""
     if ai_client:
         try:
-            response = ai_client.models.generate_content(
+            response = await ai_client.aio.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt
             )
@@ -602,61 +600,73 @@ Deliver an explosive, emotional climax.
             f"Ladies and gentlemen, the moment of truth has arrived! With an incredible total score of {winner_points} points, the winner of Member of the Month is... {winner_name}! A massive congratulations to {winner_name}, and thank you all for watching. Goodnight!"
         )
 
-    # --- 3. LIVE BROADCAST EXECUTION (CORRECT REVEAL ORDER) ---
+    # --- 3. PRE-GENERATE ALL AUDIO IN PARALLEL (ELIMINATES MID-BROADCAST LAG) ---
+    await text_channel.send("🎙️ *Synthesizing host broadcast audio...*")
+    audio_files = await asyncio.gather(*[synthesize_tts_file(sec) for sec in sections])
 
-    # Act 1: Intro Speech
-    await text_channel.send("✨ **THE GRAND FINAL BROADCAST IS NOW LIVE!** 🎙️")
-    await play_tts_audio(vc, sections[0])
-    await asyncio.sleep(1.5)
+    # --- 4. LIVE BROADCAST EXECUTION ---
+    try:
+        # Act 1: Intro Speech
+        await text_channel.send("✨ **THE GRAND FINAL BROADCAST IS NOW LIVE!** 🎙️")
+        await play_audio_file(vc, audio_files[0])
+        await asyncio.sleep(0.5)
 
-    # Act 2: Staff Juries (Spoken First, Ballot Revealed After)
-    staff_juries = list(poll_data["staff_votes"].values())
-    section_index = 1
-    
-    for jury in staff_juries:
-        jury_name = jury["name"]
-        ballot = jury["ballot"]
-        sorted_ballot = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
+        # Act 2: Staff Juries (One by One)
+        staff_juries = list(poll_data["staff_votes"].values())
+        section_index = 1
         
-        # 1. Voice speaks and announces the 12 points
-        if section_index < len(sections):
-            await play_tts_audio(vc, sections[section_index])
+        for jury in staff_juries:
+            jury_name = jury["name"]
+            ballot = jury["ballot"]
+            sorted_ballot = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
+            
+            # Voice speaks first
+            if section_index < len(audio_files):
+                await play_audio_file(vc, audio_files[section_index])
+                section_index += 1
+            
+            # Text ballot revealed immediately after audio completes
+            ballot_display = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_ballot])
+            await text_channel.send(f"🎙️ **Jury Ballot from {jury_name}:**\n{ballot_display}")
+            await asyncio.sleep(0.6)
+
+        # Act 3: Staff Scoreboard Standings
+        embed_staff = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=False)
+        await text_channel.send("📊 **Scoreboard Standings after Jury Voting:**", embed=embed_staff)
+        await asyncio.sleep(0.8)
+
+        # Act 4: Public Televotes
+        await text_channel.send("🗳️ **Now Announcing the Public Member Televotes!**")
+        if section_index < len(audio_files):
+            await play_audio_file(vc, audio_files[section_index])
             section_index += 1
+
+        televote_summary = "\n".join([f"• **{pts} pts** ➡️ {c}" for c, pts in sorted_televotes])
+        await text_channel.send(f"📊 **Public Televote Points Added:**\n{televote_summary}")
+        await asyncio.sleep(0.8)
+
+        # Act 5: Grand Winner Coronation
+        poll_data["status"] = "closed"
+        await text_channel.send("🥁 **AND THE WINNER IS...**")
         
-        # 2. Ballot is revealed in text ONLY AFTER the speech ends
-        ballot_display = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_ballot])
-        await text_channel.send(f"🎙️ **Jury Ballot from {jury_name}:**\n{ballot_display}")
-        await asyncio.sleep(2.0)
+        if section_index < len(audio_files):
+            await play_audio_file(vc, audio_files[section_index])
 
-    # Act 3: Staff Scoreboard Reveal
-    embed_staff = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=False)
-    await text_channel.send("📊 **Scoreboard Standings after Jury Voting:**", embed=embed_staff)
-    await asyncio.sleep(2.5)
+        # Gold Scoreboard Embed posted after the host declares the winner
+        embed_final = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=True)
+        await text_channel.send(f"🏆 **🎉 CONGRATULATIONS TO OUR WINNER: {winner_name}! 🎉**", embed=embed_final)
 
-    # Act 4: Public Televotes (Spoken First, Breakdown Revealed After)
-    await text_channel.send("🗳️ **Now Announcing the Public Member Televotes!**")
-    if section_index < len(sections):
-        await play_tts_audio(vc, sections[section_index])
-        section_index += 1
+        await asyncio.sleep(3.0)
+        await vc.disconnect()
 
-    televote_summary = "\n".join([f"• **{pts} pts** ➡️ {c}" for c, pts in sorted_televotes])
-    await text_channel.send(f"📊 **Public Televote Points Added:**\n{televote_summary}")
-    await asyncio.sleep(2.5)
-
-    # Act 5: Grand Winner Coronation (Spoken First, Winner Embed Revealed After)
-    poll_data["status"] = "closed"
-    await text_channel.send("🥁 **AND THE WINNER IS...**")
-    
-    # 1. Voice delivers the climactic coronation announcement
-    if section_index < len(sections):
-        await play_tts_audio(vc, sections[section_index])
-
-    # 2. Winner embed and trophy message posted ONLY AFTER audio ends
-    embed_final = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=True)
-    await text_channel.send(f"🏆 **🎉 CONGRATULATIONS TO OUR WINNER: {winner_name}! 🎉**", embed=embed_final)
-
-    await asyncio.sleep(4)
-    await vc.disconnect()
+    finally:
+        # Clean up temporary audio files
+        for f in audio_files:
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
 
 # --- WEB SERVER (For 24/7 Hosting) ---
