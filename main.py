@@ -8,6 +8,7 @@ from flask import Flask
 import discord
 import wave
 import edge_tts
+import base64
 from discord import app_commands
 from discord.ext import commands
 from google.genai import types
@@ -105,52 +106,66 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
 
 
 # --- GEMINI NATIVE VOICE CONFIGURATION ---
-# Supported Gemini Voices: "Achird", "Achernar", "Alnilam", "Fenrir", "Puck", "Aoede", "Kore"
+# Supported Gemini Voices: "Achird", "Achernar", "Fenrir", "Puck", "Alnilam", "Aoede", "Kore"
 GEMINI_VOICE_NAME = "Achird" 
 
 async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
-    """Generates and streams high-energy audio via Gemini TTS (with Edge-TTS fallback)."""
+    """Generates audio directly using Gemini's native HD TTS voice models."""
     if not text.strip():
         return
         
-    temp_wav = f"tts_{uuid.uuid4().hex[:6]}.wav"
+    temp_wav = f"gemini_tts_{uuid.uuid4().hex[:6]}.wav"
     audio_generated = False
 
-    # 1. Try Gemini Native Voice (gemini-2.5-flash-preview-tts)
     if ai_client:
-        try:
-            response = ai_client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
-                contents=text,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=GEMINI_VOICE_NAME
+        # Prompt Gemini with performance / emotion direction
+        prompt_with_tone = f"Say enthusiastically with dramatic Eurovision game show energy: {text}"
+        
+        # Try official Gemini TTS model endpoints in order
+        for model_id in ["gemini-2.5-flash-tts", "gemini-3.1-flash-tts-preview"]:
+            try:
+                response = ai_client.models.generate_content(
+                    model=model_id,
+                    contents=prompt_with_tone,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=GEMINI_VOICE_NAME
+                                )
                             )
                         )
                     )
                 )
-            )
-            
-            # Extract raw PCM audio bytes and write to 24kHz WAV
-            if response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if part.inline_data and part.inline_data.data:
-                        with wave.open(temp_wav, "wb") as wf:
-                            wf.setnchannels(1)        # Mono
-                            wf.setsampwidth(2)        # 16-bit
-                            wf.setframerate(24000)    # 24kHz
-                            wf.writeframes(part.inline_data.data)
-                        audio_generated = True
-                        break
-        except Exception as e:
-            print(f"[Gemini TTS Notice] Falling back to neural announcer: {e}")
+                
+                # Extract and decode audio bytes
+                if response.candidates and response.candidates[0].content.parts:
+                    for part in response.candidates[0].content.parts:
+                        if part.inline_data and part.inline_data.data:
+                            pcm_data = part.inline_data.data
+                            # Decode base64 if returned as string
+                            if isinstance(pcm_data, str):
+                                pcm_data = base64.b64decode(pcm_data)
+                                
+                            with wave.open(temp_wav, "wb") as wf:
+                                wf.setnchannels(1)        # Mono
+                                wf.setsampwidth(2)        # 16-bit
+                                wf.setframerate(24000)    # 24kHz Sample Rate
+                                wf.writeframes(pcm_data)
+                                
+                            audio_generated = True
+                            break
+                            
+                if audio_generated:
+                    break
+            except Exception as e:
+                print(f"[Gemini TTS Notice ({model_id})]: {e}")
 
-    # 2. Fallback to Expressive Game-Show Voice if Gemini audio fails
+    # Fallback to Edge-TTS only if Gemini fails completely
     if not audio_generated or not os.path.exists(temp_wav):
         try:
+            import edge_tts
             communicate = edge_tts.Communicate(
                 text=text,
                 voice="en-US-GuyNeural",
@@ -162,7 +177,7 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
         except Exception as e:
             print(f"[TTS Fallback Error]: {e}")
 
-    # 3. Stream to Discord Voice
+    # Stream to Discord Voice
     if audio_generated and os.path.exists(temp_wav):
         try:
             audio_source = discord.FFmpegPCMAudio(temp_wav)
@@ -177,7 +192,6 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
                 os.remove(temp_wav)
             except Exception:
                 pass
-
 # --- CANDIDATE SETUP UI ---
 
 class ServerMemberSelect(discord.ui.UserSelect):
