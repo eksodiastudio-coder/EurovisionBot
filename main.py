@@ -106,8 +106,8 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
 
 
 # --- GEMINI NATIVE VOICE CONFIGURATION ---
-# Supported Gemini Voices: "Achird", "Achernar", "Fenrir", "Puck", "Alnilam", "Aoede", "Kore"
-GEMINI_VOICE_NAME = "Achird" 
+# Recommended Gemini Voices: "Fenrir" (Excitable/High Energy), "Puck" (Upbeat), "Aoede" (Dynamic), "Kore"
+GEMINI_VOICE_NAME = "Fenrir"
 
 async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
     """Generates audio directly using Gemini's native HD TTS voice models."""
@@ -121,8 +121,8 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
         # Prompt Gemini with performance / emotion direction
         prompt_with_tone = f"Say enthusiastically with dramatic Eurovision game show energy: {text}"
         
-        # Try official Gemini TTS model endpoints in order
-        for model_id in ["gemini-2.5-flash-tts", "gemini-3.1-flash-tts-preview"]:
+        # Valid Gemini models supporting native audio output
+        for model_id in ["gemini-2.0-flash", "gemini-2.5-flash"]:
             try:
                 response = ai_client.models.generate_content(
                     model=model_id,
@@ -165,7 +165,7 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
     # Fallback to Edge-TTS only if Gemini fails completely
     if not audio_generated or not os.path.exists(temp_wav):
         try:
-            import edge_tts
+            print("[TTS Fallback]: Gemini voice generation failed, falling back to Edge-TTS.")
             communicate = edge_tts.Communicate(
                 text=text,
                 voice="en-US-GuyNeural",
