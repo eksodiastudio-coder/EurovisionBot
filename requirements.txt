@@ -1,6 +1,5 @@
 discord.py[voice]
 PyNaCl
 google-genai
-edge-tts
 Flask
 gunicorn
