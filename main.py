@@ -55,9 +55,17 @@ def is_staff():
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.guild:
             return False
-        member = interaction.guild.get_member(interaction.user.id)
+            
+        # interaction.user is already a Member object with roles and permissions
+        member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
         if not member:
             return False
+
+        # Automatically allow server owner and administrators
+        if member.id == interaction.guild.owner_id or member.guild_permissions.administrator:
+            return True
+
+        # Check Staff / HR role IDs
         return any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles)
     return app_commands.check(predicate)
 
