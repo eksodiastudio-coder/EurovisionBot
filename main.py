@@ -2,6 +2,7 @@ import os
 import asyncio
 import uuid
 import traceback
+import subprocess
 from threading import Thread
 from flask import Flask
 
@@ -21,6 +22,14 @@ STAFF_ROLE_ID = 1449084902539657288
 HR_ROLE_ID = 1460385491261194464  
 
 EUROVISION_POINTS = [12, 10, 8, 7, 6, 5, 4, 3, 2, 1]
+
+# --- BACKGROUND MUSIC PATHS (Place files in a /music folder or your root directory) ---
+BGM_FILES = {
+    "intro": "music/bgm_intro.mp3",       # Grand Eurovision fanfare
+    "jury": "music/bgm_jury.mp3",         # Tense, rhythmic jury beat
+    "televote": "music/bgm_televote.mp3", # Escalating, high-stakes pulse
+    "winner": "music/bgm_winner.mp3"      # Celebratory victory theme
+}
 
 # Initialize Gemini Client
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -114,8 +123,38 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
 GEMINI_VOICE_NAME = "Achird"
 TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
 
-async def synthesize_tts_file(text: str) -> str:
-    """Generates audio file asynchronously with Achird voice."""
+def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.20) -> str:
+    """Mixes background music under the TTS speech using FFmpeg with volume ducking."""
+    bgm_path = BGM_FILES.get(bgm_key)
+    if not bgm_path or not os.path.exists(bgm_path):
+        return tts_wav_path  # Return raw speech if no BGM file is present
+
+    mixed_output_path = f"mixed_{uuid.uuid4().hex[:8]}.wav"
+    try:
+        # Loop BGM infinitely, lower its volume to duck under voice, and cut when TTS ends
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", tts_wav_path,
+            "-stream_loop", "-1", "-i", bgm_path,
+            "-filter_complex",
+            f"[0:a]volume=1.0[voice];[1:a]volume={bgm_volume}[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2",
+            "-c:a", "pcm_s16le",
+            mixed_output_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        
+        # Clean up unmixed voice file
+        if os.path.exists(tts_wav_path):
+            os.remove(tts_wav_path)
+            
+        return mixed_output_path
+    except Exception as e:
+        print(f"[Audio Mixing Error for {bgm_key}]: {e}")
+        return tts_wav_path
+
+
+async def synthesize_tts_file(text: str, bgm_phase: str = None) -> str:
+    """Generates audio file with Achird voice and mixes phase background music."""
     if not text.strip():
         return None
         
@@ -127,7 +166,6 @@ async def synthesize_tts_file(text: str) -> str:
         
         for model in TTS_MODELS:
             try:
-                # Async call prevents blocking Discord.py event loop
                 response = await ai_client.aio.models.generate_content(
                     model=model,
                     contents=tagged_text,
@@ -178,11 +216,17 @@ async def synthesize_tts_file(text: str) -> str:
         except Exception as e:
             print(f"[TTS Fallback Error]: {e}")
 
-    return temp_wav if audio_generated and os.path.exists(temp_wav) else None
+    if audio_generated and os.path.exists(temp_wav):
+        if bgm_phase:
+            # Mix background music asynchronously in thread to avoid blocking
+            return await asyncio.to_thread(mix_audio_with_bgm, temp_wav, bgm_phase)
+        return temp_wav
+
+    return None
 
 
 async def play_audio_file(voice_client: discord.VoiceClient, filepath: str):
-    """Streams a pre-generated audio file to Discord voice without generation delay."""
+    """Streams the mixed audio file to Discord voice."""
     if not filepath or not os.path.exists(filepath):
         return
         
@@ -531,7 +575,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     winner_points = sorted_final[0][1] if sorted_final else 0
     runner_up = sorted_final[1][0] if len(sorted_final) > 1 else None
 
-    # --- 2. GENERATE SCRIPT WITH ASYNC GEMINI ---
+    # --- 2. GENERATE DRAMATIC SCRIPT ---
     prompt = f'''
 You are the charismatic, dramatic, and iconic Game Show and Eurovision Host for tonight's Grand Final!
 Event Name: {poll_data['title']}
@@ -600,18 +644,38 @@ Deliver an explosive, emotional climax.
             f"Ladies and gentlemen, the moment of truth has arrived! With an incredible total score of {winner_points} points, the winner of Member of the Month is... {winner_name}! A massive congratulations to {winner_name}, and thank you all for watching. Goodnight!"
         )
 
-    # --- 3. PRE-GENERATE ALL AUDIO IN PARALLEL (ELIMINATES MID-BROADCAST LAG) ---
-    await text_channel.send("🎙️ *Synthesizing host broadcast audio...*")
-    audio_files = await asyncio.gather(*[synthesize_tts_file(sec) for sec in sections])
+    # --- 3. MAP SECTIONS TO SPECIFIC BGM PHASES ---
+    # Phase mapping: [0] = intro, [1:-2] = jury, [-2] = televote, [-1] = winner
+    num_sections = len(sections)
+    phase_mapping = []
+    
+    for i in range(num_sections):
+        if i == 0:
+            phase_mapping.append("intro")
+        elif i == num_sections - 2:
+            phase_mapping.append("televote")
+        elif i == num_sections - 1:
+            phase_mapping.append("winner")
+        else:
+            phase_mapping.append("jury")
 
-    # --- 4. LIVE BROADCAST EXECUTION ---
+    # --- 4. PRE-GENERATE ALL AUDIO WITH PHASE-MATCHED BGM IN PARALLEL ---
+    await text_channel.send("🎙️ *Synthesizing host broadcast & mixing Eurovision background tracks...*")
+    
+    tasks = [
+        synthesize_tts_file(sec, bgm_phase=phase)
+        for sec, phase in zip(sections, phase_mapping)
+    ]
+    audio_files = await asyncio.gather(*tasks)
+
+    # --- 5. LIVE BROADCAST EXECUTION ---
     try:
-        # Act 1: Intro Speech
+        # Act 1: Intro Speech (Intro Fanfare BGM)
         await text_channel.send("✨ **THE GRAND FINAL BROADCAST IS NOW LIVE!** 🎙️")
         await play_audio_file(vc, audio_files[0])
         await asyncio.sleep(0.5)
 
-        # Act 2: Staff Juries (One by One)
+        # Act 2: Staff Juries (Jury Tension Beat BGM)
         staff_juries = list(poll_data["staff_votes"].values())
         section_index = 1
         
@@ -620,12 +684,12 @@ Deliver an explosive, emotional climax.
             ballot = jury["ballot"]
             sorted_ballot = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
             
-            # Voice speaks first
+            # Voice announces points with jury music underneath
             if section_index < len(audio_files):
                 await play_audio_file(vc, audio_files[section_index])
                 section_index += 1
             
-            # Text ballot revealed immediately after audio completes
+            # Text ballot revealed after the voice finishes
             ballot_display = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_ballot])
             await text_channel.send(f"🎙️ **Jury Ballot from {jury_name}:**\n{ballot_display}")
             await asyncio.sleep(0.6)
@@ -635,7 +699,7 @@ Deliver an explosive, emotional climax.
         await text_channel.send("📊 **Scoreboard Standings after Jury Voting:**", embed=embed_staff)
         await asyncio.sleep(0.8)
 
-        # Act 4: Public Televotes
+        # Act 4: Public Televotes (High-Stakes Televote Pulse BGM)
         await text_channel.send("🗳️ **Now Announcing the Public Member Televotes!**")
         if section_index < len(audio_files):
             await play_audio_file(vc, audio_files[section_index])
@@ -645,14 +709,14 @@ Deliver an explosive, emotional climax.
         await text_channel.send(f"📊 **Public Televote Points Added:**\n{televote_summary}")
         await asyncio.sleep(0.8)
 
-        # Act 5: Grand Winner Coronation
+        # Act 5: Grand Winner Coronation (Celebratory Winner Fanfare BGM)
         poll_data["status"] = "closed"
         await text_channel.send("🥁 **AND THE WINNER IS...**")
         
         if section_index < len(audio_files):
             await play_audio_file(vc, audio_files[section_index])
 
-        # Gold Scoreboard Embed posted after the host declares the winner
+        # Final Embed and Congratulations
         embed_final = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=True)
         await text_channel.send(f"🏆 **🎉 CONGRATULATIONS TO OUR WINNER: {winner_name}! 🎉**", embed=embed_final)
 
@@ -660,7 +724,7 @@ Deliver an explosive, emotional climax.
         await vc.disconnect()
 
     finally:
-        # Clean up temporary audio files
+        # Clean up temporary mixed WAV files
         for f in audio_files:
             if f and os.path.exists(f):
                 try:
