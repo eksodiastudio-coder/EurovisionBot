@@ -110,7 +110,7 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
 # 3. "en-US-ChristopherNeural" -> Confident Radio Host / Announcer
 # 4. "en-AU-WilliamNeural"     -> Upbeat Australian Presenter
 
-ANNOUNCER_VOICE = "en-US-GuyNeural"
+ANNOUNCER_VOICE = "en-GB-RyanNeural"
 
 async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
     """Generates expressive, high-energy neural audio and plays it in voice."""
@@ -447,7 +447,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     
     poll_data = bot.polls[poll_id]
     poll_data["status"] = "live_show"
-    await interaction.response.send_message(f"🎙️ **Starting the Live Grand Final in {voice_channel.mention}!**")
+    await interaction.response.send_message(f"🎙️ **Starting the Grand Final Live Broadcast in {voice_channel.mention}!**")
 
     # Connect to Voice Channel
     try:
@@ -457,50 +457,70 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
 
     text_channel = interaction.channel
 
-    # Format staff ballots for the prompt
+    # --- 1. CALCULATE ALL TOTALS IN ADVANCE ---
+    # Staff points breakdown
     staff_breakdown_text = ""
+    staff_total_points = {c: 0 for c in poll_data["candidates"]}
     for u_id, s_data in poll_data["staff_votes"].items():
         name = s_data["name"]
         ballot = s_data["ballot"]
+        for c, pts in ballot.items():
+            staff_total_points[c] += pts
         sorted_b = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
         ballot_str = ", ".join([f"{c}: {p}pts" for c, p in sorted_b])
-        staff_breakdown_text += f"\n- Staff Juror '{name}': {ballot_str}"
+        staff_breakdown_text += f"\n- Juror '{name}': {ballot_str}"
 
-    # Calculate public televotes
+    # Member public points breakdown
     televote_totals = {c: 0 for c in poll_data["candidates"]}
     for u_id, b in poll_data["member_votes"].items():
         for c, pts in b.items():
             televote_totals[c] += pts
     sorted_televotes = sorted(televote_totals.items(), key=lambda x: x[1])
 
-    # 1. Ask Gemini to write an exciting script
-    prompt = f"""
-    You are the iconic, enthusiastic, and electric host of the Eurovision Song Contest Grand Final.
-    Tonight is the big reveal show for: '{poll_data['title']}'!
+    # Combined final scores
+    combined_scores = {c: staff_total_points.get(c, 0) + televote_totals.get(c, 0) for c in poll_data["candidates"]}
+    sorted_final = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
     
-    DATA:
-    - Candidates: {poll_data['candidates']}
-    - Staff Juries and their specific votes:{staff_breakdown_text}
-    - Public Member Televotes (total points received per candidate): {sorted_televotes}
-    
-    INSTRUCTIONS FOR SCRIPT:
-    Produce clean spoken lines for text-to-speech. Do not use asterisks, markdown, emojis, or sound effect brackets.
-    Divide your response into distinct sections using the exact delimiter '---SECTION---'.
-    
-    1. SECTION 1 (INTRO): Give a thrilling, high-energy Eurovision greeting to the server! Hype up the final results.
-    
-    2. SECTION 2 TO (N+1) (ONE SECTION PER STAFF JURY):
-       For each staff juror, create a section where you say:
-       "Let us now see the votes from [Staff Name]!"
-       Announce their lower point awards briefly, then build massive suspense and announce:
-       "And [Staff Name]'s twelve points go to... [Candidate Name]!"
-    
-    3. NEXT SECTION (TELEVOTES):
-       Announce the public community televotes from lowest to highest.
-    
-    4. FINAL SECTION (WINNER):
-       Crown the ultimate Member of the Month champion with fireworks energy, thank everyone, and close the show!
-    """
+    winner_name = sorted_final[0][0] if sorted_final else "Nobody"
+    winner_points = sorted_final[0][1] if sorted_final else 0
+    runner_up = sorted_final[1][0] if len(sorted_final) > 1 else None
+
+   # --- 2. GENERATE A DEEP, DRAMATIC SCRIPT WITH GEMINI ---
+    prompt = f'''
+You are the charismatic, dramatic, and iconic Game Show and Eurovision Host for tonight's Grand Final!
+Event Name: {poll_data['title']}
+
+STANDINGS DATA:
+- All Candidates: {poll_data['candidates']}
+- Staff Juries and exact votes: {staff_breakdown_text}
+- Public Member Televote results in ascending order: {sorted_televotes}
+- DEFINITIVE WINNER: {winner_name} with {winner_points} points!
+- RUNNER UP: {runner_up}
+
+INSTRUCTIONS:
+Write a rich, energetic, and comprehensive broadcast script for text-to-speech.
+Use expressive language, suspenseful pacing, and Eurovision game-show hype.
+Do NOT use asterisks, markdown bolding, emojis, brackets, or stage directions. Deliver ONLY spoken words.
+Divide each act using the exact delimiter ---SECTION---.
+
+SECTION 1 (PROLOGUE AND WELCOME):
+Give a grand Eurovision opening. Welcome the server, praise the nominees, hype up the community, and set the stakes for tonight's crown.
+
+SECTIONS 2 TO N (ONE DETAILED SECTION PER STAFF JURY):
+For each staff juror, create a complete segment:
+- Greet and introduce the juror.
+- Mention some of their lower or mid points.
+- Build dramatic suspense and announce their twelve points winner clearly.
+
+NEXT SECTION (PUBLIC TELEVOTES):
+Announce the public member televotes. Remind the audience that the televotes can change everything. Reveal points candidate by candidate from lowest to highest with rising tension.
+
+FINAL SECTION (GRAND WINNER CORONATION):
+Deliver an explosive, emotional climax.
+- Build maximum suspense between the top contenders.
+- Explicitly announce the winner {winner_name} as the new Member of the Month.
+- Celebrate their victory with grand fanfare, give a heartfelt thank you to everyone who voted, and sign off the broadcast.
+'''
 
     host_script = ""
     if ai_client:
@@ -513,29 +533,34 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
         except Exception as e:
             print(f"Gemini API Error: {e}")
 
-    # Parse sections
+    # Fallback if Gemini is unavailable
     if host_script and "---SECTION---" in host_script:
         sections = [s.strip() for s in host_script.split("---SECTION---") if s.strip()]
     else:
-        # Fallback if AI generation encounters issues
         sections = [
-            f"Good evening and welcome to the Grand Final of {poll_data['title']}! The votes are in, and the tension is electric!"
+            f"Good evening Europe, good evening world, and welcome to the Grand Final of {poll_data['title']}! What an incredible month it has been. Tonight, one of our amazing nominees will be crowned champion. Let the voting begin!"
         ]
         for u_id, s_data in poll_data["staff_votes"].items():
             name = s_data["name"]
             sorted_b = sorted(s_data["ballot"].items(), key=lambda x: x[1], reverse=True)
             top_candidate = sorted_b[0][0] if sorted_b else "the leader"
-            sections.append(f"Here are the votes from our jury member {name}. And {name}'s twelve points go to... {top_candidate}!")
-        sections.append("And now it is time for the public member televotes! Let us see what the community decided.")
-        sections.append("What a night! Congratulations to our winner of Member of the Month! Goodnight everyone!")
+            sections.append(
+                f"Let us turn our attention to our esteemed jury member, {name}. The tension in the arena is palpable. And {name}'s coveted twelve points go to... {top_candidate}!"
+            )
+        sections.append(
+            "The jury votes are locked in, but this competition is far from over. It is now time for the public member televotes! Every single vote counts."
+        )
+        sections.append(
+            f"Ladies and gentlemen, the moment of truth has arrived! With an incredible total score of {winner_points} points, the winner of Member of the Month is... {winner_name}! A massive congratulations to {winner_name}, and thank you all for watching. Goodnight!"
+        )
 
-    # 2. RUN THE SHOW LIVE
-    # Intro
-    await text_channel.send("🎉 **THE GRAND FINAL IS LIVE!** 🎙️")
+    # --- 3. LIVE BROADCAST EXECUTION ---
+    # Act 1: Intro
+    await text_channel.send("✨ **THE GRAND FINAL BROADCAST IS NOW LIVE!** 🎙️")
     await play_tts_audio(vc, sections[0])
     await asyncio.sleep(2)
 
-    # Step through staff juries
+    # Act 2: Staff Juries (One by One)
     staff_juries = list(poll_data["staff_votes"].values())
     section_index = 1
     
@@ -545,34 +570,34 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
         sorted_ballot = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
         
         ballot_display = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_ballot])
-        await text_channel.send(f"🎙️ **Jury Votes from {jury_name}:**\n{ballot_display}")
+        await text_channel.send(f"🎙️ **Jury Ballot from {jury_name}:**\n{ballot_display}")
         
         if section_index < len(sections):
             await play_tts_audio(vc, sections[section_index])
             section_index += 1
-        await asyncio.sleep(2)
+        await asyncio.sleep(2.5)
 
-    # Show Staff Scoreboard
+    # Act 3: Staff Scoreboard Reveal
     embed_staff = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=False)
-    await text_channel.send("📊 **Scoreboard after Staff Jury Voting:**", embed=embed_staff)
+    await text_channel.send("📊 **Scoreboard Standings after Jury Voting:**", embed=embed_staff)
     await asyncio.sleep(3)
 
-    # Televotes
-    await text_channel.send("🗳️ **Now Revealing the Public Member Televotes!**")
+    # Act 4: Public Televotes
+    await text_channel.send("🗳️ **Now Announcing the Public Member Televotes!**")
     if section_index < len(sections):
         await play_tts_audio(vc, sections[section_index])
         section_index += 1
-    await asyncio.sleep(2)
+    await asyncio.sleep(2.5)
 
-    # Winner & Final Scoreboard
+    # Act 5: Grand Winner Coronation
     poll_data["status"] = "closed"
     embed_final = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=True)
-    await text_channel.send("🏆 **THE GRAND FINAL WINNER & FINAL STANDINGS!**", embed=embed_final)
+    await text_channel.send(f"🏆 **🎉 CONGRATULATIONS TO OUR WINNER: {winner_name}! 🎉**", embed=embed_final)
     
     if section_index < len(sections):
         await play_tts_audio(vc, sections[section_index])
 
-    await asyncio.sleep(4)
+    await asyncio.sleep(5)
     await vc.disconnect()
 
 
