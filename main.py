@@ -1,23 +1,35 @@
 import os
+import asyncio
+import uuid
+import traceback
+from threading import Thread
+from flask import Flask
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-import uuid
-import traceback
-from flask import Flask
-from threading import Thread
+from gtts import gTTS  # You can replace this with Google Cloud TTS or ElevenLabs for hyper-realistic voices
+
+# --- Google GenAI SDK ---
+from google import genai
+from google.genai import types
 
 # --- CONFIGURATION ---
 STAFF_ROLE_ID = 1449084902539657288  
-HR_ROLE_ID = 1460385491261194464  # <-- Replace with your actual server HR Role ID
+HR_ROLE_ID = 1460385491261194464  
 
 EUROVISION_POINTS = [12, 10, 8, 7, 6, 5, 4, 3, 2, 1]
+
+# Initialize Gemini Client
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 class EurovisionBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True 
+        intents.voice_states = True
         super().__init__(command_prefix="!", intents=intents)
         self.polls = {}
 
@@ -52,22 +64,18 @@ def get_initial_points(candidate_count):
         return EUROVISION_POINTS[:candidate_count]
     return EUROVISION_POINTS.copy()
 
-def generate_scoreboard_embed(poll_id, poll_data, reveal_members=False):
+def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_members=False):
     title = f"🏆 Poll: {poll_data['title']} (ID: {poll_id})"
     embed = discord.Embed(title=title, color=discord.Color.blue())
     
     scores = {candidate: 0 for candidate in poll_data["candidates"]}
     
-    if poll_data["status"] in ["staff_voting", "closed"]:
+    if reveal_staff:
         for user_votes in poll_data["staff_votes"].values():
             for candidate, points in user_votes.items():
                 scores[candidate] += points
 
-    if poll_data["type"] == "simple" and poll_data["status"] == "closed":
-        for user_votes in poll_data["member_votes"].values():
-            for candidate, points in user_votes.items():
-                scores[candidate] += points
-    elif poll_data["type"] == "hybrid" and reveal_members:
+    if reveal_members:
         for user_votes in poll_data["member_votes"].values():
             for candidate, points in user_votes.items():
                 scores[candidate] += points
@@ -82,17 +90,45 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_members=False):
     
     status_text = "Status: "
     if poll_data["status"] == "members_voting":
-        status_text += "🟢 Public Voting Open"
+        status_text += "🟢 Public Member Voting Open"
     elif poll_data["status"] == "staff_voting":
-        status_text += "🟡 Staff Live Voting in Progress"
+        status_text += "🟡 Secret Staff Jury Voting in Progress"
+    elif poll_data["status"] == "live_show":
+        status_text += "🎙️ Live Grand Final in Progress!"
     else:
         status_text += "🔴 Closed"
         
-    embed.set_footer(text=f"{status_text} | Total member voters: {len(poll_data['member_votes'])}")
+    embed.set_footer(text=f"{status_text} | Member ballots: {len(poll_data['member_votes'])} | Staff ballots: {len(poll_data['staff_votes'])}")
     return embed
 
 
-# --- INTERACTIVE POLL SETUP UI ---
+# --- AUDIO HELPER ---
+
+async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
+    """Generates audio from text and plays it in the voice channel."""
+    temp_file = f"tts_{uuid.uuid4().hex[:6]}.mp3"
+    try:
+        # Generate speech
+        tts = gTTS(text=text, lang="en", tld="com")
+        tts.save(temp_file)
+        
+        # Play over discord voice
+        audio_source = discord.FFmpegPCMAudio(temp_file)
+        voice_client.play(audio_source)
+        
+        while voice_client.is_playing():
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        print(f"Error in TTS Playback: {e}")
+    finally:
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+
+
+# --- CANDIDATE SETUP UI ---
 
 class ServerMemberSelect(discord.ui.UserSelect):
     def __init__(self):
@@ -113,7 +149,7 @@ class ServerMemberSelect(discord.ui.UserSelect):
             content=(
                 f"✨ **Configure Your Candidates**\n\n"
                 f"**Selected Candidates ({len(self.view.selected_users)}):**\n{candidate_list}\n\n"
-                "You can select more candidates from the dropdown or click **Continue** to finalize."
+                "You can select more candidates or click **Continue** to finalize."
             ),
             view=self.view
         )
@@ -126,16 +162,12 @@ class PollSetupView(discord.ui.View):
         self.poll_type = poll_type
         self.bot = bot_instance
         self.selected_users = []
-        
         self.add_item(ServerMemberSelect())
 
     @discord.ui.button(label="Continue", style=discord.ButtonStyle.success, row=1)
     async def continue_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.selected_users:
-            await interaction.response.send_message(
-                "❌ Please select at least one member to be a candidate before continuing.", 
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ Select at least one candidate.", ephemeral=True)
             return
 
         candidate_list = [member.display_name for member in self.selected_users]
@@ -152,7 +184,7 @@ class PollSetupView(discord.ui.View):
         }
         
         await interaction.response.edit_message(
-            content=f"✅ **Poll Setup Completed!**\nSelected Candidates:\n" + "\n".join([f"• {name}" for name in candidate_list]),
+            content=f"✅ **Poll Setup Completed!**\n" + "\n".join([f"• {name}" for name in candidate_list]),
             view=None
         )
         
@@ -170,7 +202,7 @@ class PollBoardView(discord.ui.View):
         self.poll_id = poll_id
         self.bot = bot_instance
 
-    @discord.ui.button(label="Vote", style=discord.ButtonStyle.primary, emoji="🗳️", custom_id="vote_button_persistent")
+    @discord.ui.button(label="Vote (3 Choices)", style=discord.ButtonStyle.primary, emoji="🗳️", custom_id="vote_button_persistent")
     async def vote_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.poll_id not in self.bot.polls:
             await interaction.response.send_message("❌ Poll data not found.", ephemeral=True)
@@ -179,34 +211,18 @@ class PollBoardView(discord.ui.View):
         poll_data = self.bot.polls[self.poll_id]
         
         if poll_data["status"] != "members_voting":
-            await interaction.response.send_message("❌ Voting is closed for this poll or has moved to the next phase.", ephemeral=True)
+            await interaction.response.send_message("❌ Public member voting is closed.", ephemeral=True)
             return
 
-        if interaction.guild:
-            member = interaction.guild.get_member(interaction.user.id)
-            if member and any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
-                await interaction.response.send_message(
-                    "❌ **Staff/HR Members Cannot Vote Here**: As a member of the Staff or HR team, you will cast your votes during the Live Staff Voting phase instead.", 
-                    ephemeral=True
-                )
-                return
-
         user_id = str(interaction.user.id)
-        
         if user_id in poll_data["member_votes"]:
-            sorted_votes = sorted(poll_data["member_votes"][user_id].items(), key=lambda x: x[0])
-            ballot_summary = "\n".join([f"**{p} pt** ➡️ {c}" for c, p in sorted_votes])
-            await interaction.response.send_message(
-                f"❌ **You have already given out your points!**\n\nYour submitted ballot:\n{ballot_summary}", 
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ **You have already voted!**", ephemeral=True)
             return
 
         view = VotingView(self.poll_id, user_id, self.bot)
         await interaction.response.send_message(
             "🗳️ **Welcome to the Voting Booth!**\n"
-            "Select up to 5 candidates from the dropdown below. Each candidate will receive 1 point.\n"
-            "*Note: If you dismiss this message before completing your ballot, your progress will reset and no points will count.*", 
+            "Select **up to 3 candidates**. Each selected candidate receives 1 point.",
             view=view, 
             ephemeral=True
         )
@@ -218,71 +234,45 @@ class StaffBoardView(discord.ui.View):
         self.poll_id = poll_id
         self.bot = bot_instance
 
-    @discord.ui.button(label="Staff Vote", style=discord.ButtonStyle.secondary, emoji="🎙️", custom_id="staff_vote_button_persistent")
+    @discord.ui.button(label="Staff Jury Vote", style=discord.ButtonStyle.secondary, emoji="🎙️", custom_id="staff_vote_btn_persistent")
     async def staff_vote_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.poll_id not in self.bot.polls:
             await interaction.response.send_message("❌ Poll data not found.", ephemeral=True)
             return
         
         poll_data = self.bot.polls[self.poll_id]
-        
         if poll_data["status"] != "staff_voting":
-            await interaction.response.send_message("❌ Staff voting is not active for this poll.", ephemeral=True)
+            await interaction.response.send_message("❌ Staff voting is not active.", ephemeral=True)
             return
 
-        if interaction.guild:
-            member = interaction.guild.get_member(interaction.user.id)
-            if not member or not any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
-                await interaction.response.send_message(
-                    "❌ **Permission Denied**: This option is restricted to server Staff and HR.", 
-                    ephemeral=True
-                )
-                return
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member or not any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
+            await interaction.response.send_message("❌ **Permission Denied**: Staff & HR only.", ephemeral=True)
+            return
 
         user_id = str(interaction.user.id)
-        
         if user_id in poll_data["staff_votes"]:
-            await interaction.response.send_message("❌ **You have already given out your points!**", ephemeral=True)
+            await interaction.response.send_message("❌ **You have already submitted your jury ballot!**", ephemeral=True)
             return
 
         view = StaffVotingView(self.poll_id, user_id, self.bot)
         await interaction.response.send_message(
-            "🎙️ **Welcome to the Live Staff Jury Booth!**\n"
-            "Assign all your points to candidates. Once you have assigned the last point value, your votes will "
-            "be officially posted in the channel and the live scoreboard will update.\n\n"
-            "*Note: If you dismiss this message early, your session resets and no votes will be announced or recorded.*", 
+            "🎙️ **Welcome to the Confidential Staff Jury Booth!**\n"
+            "Assign all your Eurovision points. Your votes will remain **secret** until the Live Show!",
             view=view, 
             ephemeral=True
         )
 
 
-# --- INTERACTIVE MEMBER VOTING UI ---
+# --- VOTING VIEWS ---
 
 class CandidateSelect(discord.ui.Select):
     def __init__(self, candidates):
         options = [discord.SelectOption(label=c, value=c) for c in candidates]
-        super().__init__(placeholder="Select a candidate to assign points...", options=options)
+        super().__init__(placeholder="Select a candidate...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        try:
-            await self.view.handle_candidate_selection(interaction, self.values[0])
-        except Exception as e:
-            print(f"[Error] CandidateSelect Callback: {e}")
-            traceback.print_exc()
-            await interaction.response.send_message(f"❌ An error occurred during selection: {e}", ephemeral=True)
-
-class ResetButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="Start Over / Reset Ballot", style=discord.ButtonStyle.danger, row=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.view
-        view.current_ballot.clear()
-        view.available_candidates = view.bot.polls[view.poll_id]["candidates"].copy()
-        if hasattr(view, "available_points"):
-            view.available_points = get_initial_points(len(view.available_candidates))
-        view.update_to_candidate_select()
-        await interaction.response.edit_message(content="🗑️ Your ballot has been reset! Let's start from the beginning.\n\nSelect your first candidate:", view=view)
+        await self.view.handle_candidate_selection(interaction, self.values[0])
 
 class VotingView(discord.ui.View):
     def __init__(self, poll_id, user_id, bot_instance):
@@ -293,7 +283,8 @@ class VotingView(discord.ui.View):
         
         poll_data = self.bot.polls[poll_id]
         self.available_candidates = poll_data["candidates"].copy()
-        self.max_votes = min(5, len(self.available_candidates))
+        # MODIFICATION: Limited to 3 votes
+        self.max_votes = min(3, len(self.available_candidates))
         self.current_ballot = {} 
 
         self.update_to_candidate_select()
@@ -301,7 +292,6 @@ class VotingView(discord.ui.View):
     def update_to_candidate_select(self):
         self.clear_items()
         self.add_item(CandidateSelect(self.available_candidates))
-        self.add_item(ResetButton())
 
     async def handle_candidate_selection(self, interaction: discord.Interaction, candidate: str):
         self.current_ballot[candidate] = 1
@@ -309,26 +299,20 @@ class VotingView(discord.ui.View):
         
         if len(self.current_ballot) >= self.max_votes or not self.available_candidates:
             self.clear_items()
-            
             self.bot.polls[self.poll_id]["member_votes"][self.user_id] = self.current_ballot
             
-            sorted_votes = sorted(self.current_ballot.items(), key=lambda x: x[0])
-            ballot_summary = "\n".join([f"**1 pt** ➡️ {c}" for c, p in sorted_votes])
-            self.add_item(ResetButton())
-            
+            ballot_summary = "\n".join([f"• **1 pt** ➡️ {c}" for c in self.current_ballot.keys()])
             await interaction.response.edit_message(
-                content=f"✅ **Voting Complete!** Here is your final ballot:\n\n{ballot_summary}\n\n*Your votes are now recorded.*",
-                view=self
+                content=f"✅ **Voting Complete!** Your submitted ballot:\n\n{ballot_summary}",
+                view=None
             )
         else:
             self.update_to_candidate_select()
             await interaction.response.edit_message(
-                content=f"✅ Recorded **1 point** for **{candidate}** ({len(self.current_ballot)}/{self.max_votes} selected).\n\nSelect your next candidate:",
+                content=f"✅ Selected **{candidate}** ({len(self.current_ballot)}/{self.max_votes}).\nSelect next candidate:",
                 view=self
             )
 
-
-# --- INTERACTIVE STAFF VOTING UI ---
 
 class StaffCandidateSelect(discord.ui.Select):
     def __init__(self, candidates):
@@ -336,12 +320,7 @@ class StaffCandidateSelect(discord.ui.Select):
         super().__init__(placeholder="Select a candidate to award points...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        try:
-            await self.view.handle_candidate_selection(interaction, self.values[0])
-        except Exception as e:
-            print(f"[Error] StaffCandidateSelect Callback: {e}")
-            traceback.print_exc()
-            await interaction.response.send_message(f"❌ An error occurred during selection: {e}", ephemeral=True)
+        await self.view.handle_candidate_selection(interaction, self.values[0])
 
 class StaffPointSelect(discord.ui.Select):
     def __init__(self, candidate, available_points):
@@ -350,12 +329,7 @@ class StaffPointSelect(discord.ui.Select):
         super().__init__(placeholder=f"Select points for {candidate}...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        try:
-            await self.view.handle_point_selection(interaction, self.candidate_name, int(self.values[0]))
-        except Exception as e:
-            print(f"[Error] StaffPointSelect Callback: {e}")
-            traceback.print_exc()
-            await interaction.response.send_message(f"❌ An error occurred during point assignment: {e}", ephemeral=True)
+        await self.view.handle_point_selection(interaction, self.candidate_name, int(self.values[0]))
 
 class StaffVotingView(discord.ui.View):
     def __init__(self, poll_id, user_id, bot_instance):
@@ -378,7 +352,7 @@ class StaffVotingView(discord.ui.View):
     async def handle_candidate_selection(self, interaction: discord.Interaction, candidate: str):
         self.clear_items()
         self.add_item(StaffPointSelect(candidate, self.available_points))
-        await interaction.response.edit_message(content=f"Awarding points to **{candidate}**.\nSelect the points value:", view=self)
+        await interaction.response.edit_message(content=f"Awarding points to **{candidate}**.\nSelect point value:", view=self)
 
     async def handle_point_selection(self, interaction: discord.Interaction, candidate: str, points: int):
         self.current_ballot[candidate] = points
@@ -386,33 +360,20 @@ class StaffVotingView(discord.ui.View):
         self.available_points.remove(points)
         
         poll_data = self.bot.polls[self.poll_id]
-        channel = self.bot.get_channel(poll_data["channel_id"])
         
         if not self.available_candidates or not self.available_points:
             self.clear_items()
-            
+            # MODIFICATION: Save silently without revealing in public chat
             poll_data["staff_votes"][self.user_id] = self.current_ballot
             
-            sorted_votes = sorted(self.current_ballot.items(), key=lambda x: x[1], reverse=True)
-            bullet_points = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_votes])
-            
-            await channel.send(
-                content=f"🎙️ **Staff Jury Live Vote**: {interaction.user.mention} has cast their votes!\n\n{bullet_points}",
-                delete_after=10
-            )
-            
-            embed = generate_scoreboard_embed(self.poll_id, poll_data)
-            message = await channel.fetch_message(poll_data["message_id"])
-            await message.edit(embed=embed, view=StaffBoardView(self.poll_id, self.bot))
-            
             await interaction.response.edit_message(
-                content="✅ **Live Voting Complete!** Your points have been officially submitted, announced, and added to the board.",
+                content="✅ **Jury Ballot Recorded!** Your votes are safely stored and will be revealed during the live show.",
                 view=None
             )
         else:
             self.update_to_candidate_select()
             await interaction.response.edit_message(
-                content=f"✅ Assigned **{points} points** to **{candidate}** locally.\n\nSelect the next candidate to vote for:",
+                content=f"✅ Assigned **{points} points** to **{candidate}**.\n\nSelect next candidate:",
                 view=self
             )
 
@@ -420,107 +381,141 @@ class StaffVotingView(discord.ui.View):
 # --- SLASH COMMANDS ---
 
 @bot.tree.command(name="create_poll", description="Create a new Eurovision-style poll.")
-@app_commands.describe(
-    title="Name of the poll",
-    poll_type="Hybrid (Staff + Member) or Simple (Member only)"
-)
+@app_commands.describe(title="Name of the poll", poll_type="Hybrid (Staff + Member) or Simple")
 @app_commands.choices(poll_type=[
     app_commands.Choice(name="Hybrid (Eurovision style)", value="hybrid"),
-    app_commands.Choice(name="Simple (Instant results)", value="simple")
+    app_commands.Choice(name="Simple (Member only)", value="simple")
 ])
 @is_staff()
 async def create_poll(interaction: discord.Interaction, title: str, poll_type: str):
     poll_id = str(uuid.uuid4())[:8]
     view = PollSetupView(poll_id, title, poll_type, bot)
-    
-    await interaction.response.send_message(
-        "✨ **Configure Your Candidates**\n"
-        "Use the dropdown menu below to select candidates to compete in this poll. "
-        "You can add as many as you like. When finished, press **Continue**.",
-        view=view,
-        ephemeral=True
-    )
+    await interaction.response.send_message("✨ **Configure Candidates** via dropdown, then click Continue.", view=view, ephemeral=True)
 
-@bot.tree.command(name="close_member_voting", description="Close the member voting phase.")
+@bot.tree.command(name="start_staff_voting", description="Close member voting and open hidden staff jury voting.")
 @is_staff()
-async def close_member_voting(interaction: discord.Interaction, poll_id: str):
+async def start_staff_voting(interaction: discord.Interaction, poll_id: str):
     if poll_id not in bot.polls:
         await interaction.response.send_message("Poll not found.", ephemeral=True)
         return
-        
     poll_data = bot.polls[poll_id]
+    poll_data["status"] = "staff_voting"
     
-    if poll_data["status"] != "members_voting":
-        await interaction.response.send_message("Poll is not in the member voting phase.", ephemeral=True)
-        return
-        
-    if poll_data["type"] == "hybrid":
-        poll_data["status"] = "staff_voting"
-        await interaction.response.send_message("Member voting closed. Moving to Staff Live Voting phase.", ephemeral=True)
-        
-        embed = generate_scoreboard_embed(poll_id, poll_data)
-        channel = bot.get_channel(poll_data["channel_id"])
-        message = await channel.fetch_message(poll_data["message_id"])
-        
-        staff_view = StaffBoardView(poll_id, bot)
-        await message.edit(embed=embed, view=staff_view)
-        
-    elif poll_data["type"] == "simple":
-        poll_data["status"] = "closed"
-        await interaction.response.send_message("Voting closed. Displaying final results.", ephemeral=True)
-        
-        embed = generate_scoreboard_embed(poll_id, poll_data)
-        channel = bot.get_channel(poll_data["channel_id"])
-        message = await channel.fetch_message(poll_data["message_id"])
-        await message.edit(embed=embed, view=None)
-
-@bot.tree.command(name="reveal_member_votes", description="Reveal and combine member votes to the board.")
-@is_staff()
-async def reveal_member_votes(interaction: discord.Interaction, poll_id: str):
-    if poll_id not in bot.polls:
-        await interaction.response.send_message("Poll not found.", ephemeral=True)
-        return
-        
-    poll_data = bot.polls[poll_id]
-    
-    if poll_data["status"] != "staff_voting":
-        await interaction.response.send_message("This action can only be taken after staff voting has concluded.", ephemeral=True)
-        return
-        
-    poll_data["status"] = "closed"
-    
-    await interaction.response.send_message("🎉 **Member votes are now being revealed and added to the scoreboard!**")
-    
-    embed = generate_scoreboard_embed(poll_id, poll_data, reveal_members=True)
+    embed = generate_scoreboard_embed(poll_id, poll_data)
     channel = bot.get_channel(poll_data["channel_id"])
     message = await channel.fetch_message(poll_data["message_id"])
-    await message.edit(embed=embed, view=None)
+    await message.edit(embed=embed, view=StaffBoardView(poll_id, bot))
+    await interaction.response.send_message("✅ Member voting is closed. Staff jury voting is now open (votes remain hidden).")
+
+@bot.tree.command(name="start_live_show", description="Host the Eurovision Grand Final via Voice Channel with Gemini!")
+@app_commands.describe(poll_id="The ID of the poll", voice_channel="Voice channel where the show will be hosted")
+@is_staff()
+async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_channel: discord.VoiceChannel):
+    if poll_id not in bot.polls:
+        await interaction.response.send_message("❌ Poll not found.", ephemeral=True)
+        return
+    
+    poll_data = bot.polls[poll_id]
+    poll_data["status"] = "live_show"
+    await interaction.response.send_message(f"🎙️ **Starting the Live Grand Final in {voice_channel.mention}!**")
+
+    # Connect to Voice Channel
+    try:
+        vc = await voice_channel.connect()
+    except Exception:
+        vc = interaction.guild.voice_client
+
+    text_channel = interaction.channel
+
+    # 1. Ask Gemini to generate the dramatic host script
+    prompt = f"""
+    You are an energetic, charming, and dramatic Eurovision Song Contest / Game Show host.
+    You are hosting the final results show for '{poll_data['title']}'.
+    
+    Here is the voting data:
+    - Candidates: {poll_data['candidates']}
+    - Staff Jury Ballots: {poll_data['staff_votes']}
+    - Member Public Ballots: {poll_data['member_votes']}
+    
+    Generate 4 separate spoken sections in plain English text (no markdown symbols, no asterisks):
+    SECTION_1_INTRO: Greet the audience, introduce the grand final, build excitement for the voting sequence.
+    SECTION_2_JURY: Announce the staff jury results step-by-step with classic Eurovision suspense ("And the 12 points go to...").
+    SECTION_3_TELEVOTE: Announce the public member televote results starting from the bottom up to the top.
+    SECTION_4_WINNER: Crown the overall Member of the Month winner with celebratory fanfare and close the show.
+    
+    Separate each section with '---SECTION---'.
+    """
+    
+    host_script = ""
+    if ai_client:
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
+            host_script = response.text
+        except Exception as e:
+            print(f"Gemini API Error: {e}")
+
+    # Fallback if AI script fails
+    if not host_script or "---SECTION---" not in host_script:
+        sections = [
+            f"Welcome ladies and gentlemen to the Grand Final of {poll_data['title']}! It is time to announce the votes.",
+            "Let us take a look at the jury points from our staff team.",
+            "And now, the moment you have all been waiting for. The public televotes from our community members!",
+            "Congratulations to our winner! Thank you all for voting, and goodnight!"
+        ]
+    else:
+        sections = [s.strip() for s in host_script.split("---SECTION---") if s.strip()]
+
+    # 2. Host the show step-by-step (Audio + Live Scoreboard update)
+    # Intro
+    await text_channel.send("🎉 **The Grand Final is Starting!** 🎙️")
+    await play_tts_audio(vc, sections[0])
+    await asyncio.sleep(2)
+
+    # Reveal Staff Jury
+    await text_channel.send("📊 **Revealing Staff Jury Votes...**")
+    embed_staff = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=False)
+    await text_channel.send(embed=embed_staff)
+    if len(sections) > 1:
+        await play_tts_audio(vc, sections[1])
+    await asyncio.sleep(3)
+
+    # Reveal Public Televotes
+    await text_channel.send("🗳️ **Revealing Public Member Votes...**")
+    if len(sections) > 2:
+        await play_tts_audio(vc, sections[2])
+    await asyncio.sleep(2)
+
+    # Final Combined Winner Reveal
+    poll_data["status"] = "closed"
+    embed_final = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=True)
+    await text_channel.send("🏆 **FINAL RESULTS & WINNER!**", embed=embed_final)
+    if len(sections) > 3:
+        await play_tts_audio(vc, sections[3])
+
+    await asyncio.sleep(3)
+    await vc.disconnect()
 
 
-# --- WEB SERVER (for Render & UptimeRobot) ---
+# --- WEB SERVER (For 24/7 Hosting) ---
 
 web_app = Flask('')
 
 @web_app.route('/')
 def home():
-    return "Bot is running online."
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    web_app.run(host='0.0.0.0', port=port)
+    return "Eurovision Bot Online."
 
 def keep_alive():
-    t = Thread(target=run_web_server)
+    t = Thread(target=lambda: web_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080))))
     t.start()
 
 
-# --- STARTUP ---
-
 if __name__ == "__main__":
-    keep_alive()  # Start the web server
-    
+    keep_alive()
     token = os.environ.get("DISCORD_TOKEN")
     if token:
         bot.run(token)
     else:
-        print("Error: 'DISCORD_TOKEN' environment variable is not set.")
+        print("Error: 'DISCORD_TOKEN' not set.")
