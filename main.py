@@ -105,28 +105,34 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
     return embed
 
 
-# --- GEMINI NATIVE VOICE CONFIGURATION ---
-# Recommended Gemini Voices: "Fenrir" (Excitable/High Energy), "Puck" (Upbeat), "Aoede" (Dynamic), "Kore"
-GEMINI_VOICE_NAME = "Fenrir"
+# --- GEMINI 3.1 FLASH TTS CONFIGURATION ---
+# Supported 3.1 Voices: "Achird", "Fenrir", "Puck", "Aoede", "Charon", "Kore", "Sadachbia", "Zephyr"
+GEMINI_VOICE_NAME = "Achird"
+TTS_MODEL_ID = "gemini-3.1-flash-tts-preview"
 
 async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
-    """Generates audio directly using Gemini's native HD TTS voice models."""
+    """Generates audio using Gemini 3.1 Flash TTS Preview with Achird."""
     if not text.strip():
         return
         
     temp_wav = f"gemini_tts_{uuid.uuid4().hex[:6]}.wav"
     audio_generated = False
 
-    if ai_client:
-        # Prompt Gemini with performance / emotion direction
-        prompt_with_tone = f"Say enthusiastically with dramatic Eurovision game show energy: {text}"
+    # Get client
+    api_key = os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key) if api_key else None
+
+    if client:
+        # Gemini 3.1 Flash TTS uses inline audio tags for dramatic expressiveness
+        tagged_text = f"[dramatic, game-show host energy] {text}"
         
-        # Valid Gemini models supporting native audio output
-        for model_id in ["gemini-2.0-flash", "gemini-2.5-flash"]:
+        # Try Gemini 3.1 Flash TTS, with 2.5 Flash Preview TTS as fallback
+        for model in ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]:
             try:
-                response = ai_client.models.generate_content(
-                    model=model_id,
-                    contents=prompt_with_tone,
+                print(f"[Gemini 3.1 TTS]: Generating voice with {model} (Voice: {GEMINI_VOICE_NAME})...")
+                response = client.models.generate_content(
+                    model=model,
+                    contents=tagged_text,
                     config=types.GenerateContentConfig(
                         response_modalities=["AUDIO"],
                         speech_config=types.SpeechConfig(
@@ -139,33 +145,37 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
                     )
                 )
                 
-                # Extract and decode audio bytes
-                if response.candidates and response.candidates[0].content.parts:
+                # Extract and write PCM audio frames
+                if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                     for part in response.candidates[0].content.parts:
                         if part.inline_data and part.inline_data.data:
                             pcm_data = part.inline_data.data
-                            # Decode base64 if returned as string
+                            
+                            # Auto-decode base64 if returned as string
                             if isinstance(pcm_data, str):
                                 pcm_data = base64.b64decode(pcm_data)
                                 
                             with wave.open(temp_wav, "wb") as wf:
                                 wf.setnchannels(1)        # Mono
-                                wf.setsampwidth(2)        # 16-bit
-                                wf.setframerate(24000)    # 24kHz Sample Rate
+                                wf.setsampwidth(2)        # 16-bit PCM
+                                wf.setframerate(24000)    # Gemini Native 24kHz
                                 wf.writeframes(pcm_data)
                                 
                             audio_generated = True
+                            print(f"[Gemini 3.1 TTS]: Successfully generated audio with {model}!")
                             break
                             
                 if audio_generated:
                     break
             except Exception as e:
-                print(f"[Gemini TTS Notice ({model_id})]: {e}")
+                print(f"[Gemini 3.1 TTS Error ({model})]: {e}")
+    else:
+        print("[Gemini 3.1 TTS Error]: GEMINI_API_KEY environment variable is not set.")
 
-    # Fallback to Edge-TTS only if Gemini fails completely
+    # Fallback to Edge-TTS only if Gemini fails
     if not audio_generated or not os.path.exists(temp_wav):
         try:
-            print("[TTS Fallback]: Gemini voice generation failed, falling back to Edge-TTS.")
+            print("[TTS Fallback]: Gemini TTS failed, using backup voice.")
             communicate = edge_tts.Communicate(
                 text=text,
                 voice="en-US-GuyNeural",
@@ -177,7 +187,7 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str):
         except Exception as e:
             print(f"[TTS Fallback Error]: {e}")
 
-    # Stream to Discord Voice
+    # Stream to Discord Voice Channel
     if audio_generated and os.path.exists(temp_wav):
         try:
             audio_source = discord.FFmpegPCMAudio(temp_wav)
