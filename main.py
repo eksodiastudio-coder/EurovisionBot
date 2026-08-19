@@ -8,7 +8,6 @@ from flask import Flask
 
 import discord
 import wave
-import edge_tts
 import base64
 from discord import app_commands
 from discord.ext import commands
@@ -119,7 +118,7 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
     return embed
 
 
-# --- GEMINI 3.1 FLASH TTS CONFIGURATION ---
+# --- GEMINI ACHIRD TTS ONLY CONFIGURATION ---
 GEMINI_VOICE_NAME = "Achird"
 TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
 
@@ -131,13 +130,11 @@ def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.20
 
     mixed_output_path = f"mixed_{uuid.uuid4().hex[:8]}.wav"
     try:
-        # Calculate voice duration to create a smooth musical outro tail
         with wave.open(tts_wav_path, "rb") as wf:
             frames = wf.getnframes()
             rate = wf.getframerate()
             voice_dur = frames / float(rate)
 
-        # 1.2s musical trail after speech finishes
         total_dur = voice_dur + 1.2
         fade_out_start = max(0.1, total_dur - 0.7)
 
@@ -164,16 +161,21 @@ def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.20
 
 
 async def synthesize_tts_file(text: str, bgm_phase: str = None) -> str:
-    """Generates audio with Achird and blends smooth background music."""
+    """Generates audio ONLY with Achird voice using robust Gemini retries."""
     if not text.strip():
         return None
         
     temp_wav = f"gemini_tts_{uuid.uuid4().hex}.wav"
     audio_generated = False
 
-    if ai_client:
-        tagged_text = f"[dramatic, game-show host energy] {text}"
-        
+    if not ai_client:
+        print("[Gemini Error]: GEMINI_API_KEY environment variable is missing.")
+        return None
+
+    tagged_text = f"[dramatic, game-show host energy] {text}"
+
+    # Try up to 3 times strictly with Achird
+    for attempt in range(3):
         for model in TTS_MODELS:
             try:
                 response = await ai_client.aio.models.generate_content(
@@ -210,27 +212,18 @@ async def synthesize_tts_file(text: str, bgm_phase: str = None) -> str:
                 if audio_generated:
                     break
             except Exception as e:
-                print(f"[Gemini 3.1 TTS ({model}) Warning]: {e}")
-
-    # Fallback to Edge-TTS only if Gemini fails
-    if not audio_generated or not os.path.exists(temp_wav):
-        try:
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice="en-US-GuyNeural",
-                rate="+10%",
-                pitch="+4Hz"
-            )
-            await communicate.save(temp_wav)
-            audio_generated = True
-        except Exception as e:
-            print(f"[TTS Fallback Error]: {e}")
+                print(f"[Gemini Achird TTS ({model}) Attempt {attempt+1} Error]: {e}")
+                
+        if audio_generated:
+            break
+        await asyncio.sleep(0.5)
 
     if audio_generated and os.path.exists(temp_wav):
         if bgm_phase:
             return await asyncio.to_thread(mix_audio_with_bgm, temp_wav, bgm_phase)
         return temp_wav
 
+    print(f"[Gemini TTS Fatal]: Failed to synthesize line with Achird: {text[:40]}...")
     return None
 
 
@@ -551,7 +544,6 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     poll_data["status"] = "live_show"
     await interaction.response.send_message(f"🎙️ **Preparing the Evolvers Grand Final Broadcast in {voice_channel.mention}...**")
 
-    # Connect to Voice Channel
     try:
         vc = await voice_channel.connect()
     except Exception:
@@ -669,8 +661,8 @@ Deliver an explosive climax. Build maximum suspense between the top contenders, 
         else:
             phase_mapping.append("jury")
 
-    # --- 4. PRE-GENERATE ALL AUDIO WITH SMOOTH BGM ENVELOPES ---
-    await text_channel.send("🎙️ *Synthesizing host broadcast & mixing Eurovision audio tracks...*")
+    # --- 4. PRE-GENERATE ALL AUDIO WITH ACHIRD IN PARALLEL ---
+    await text_channel.send("🎙️ *Synthesizing host broadcast & mixing Eurovision audio tracks with Achird...*")
     
     tasks = [
         synthesize_tts_file(sec, bgm_phase=phase)
@@ -678,11 +670,17 @@ Deliver an explosive climax. Build maximum suspense between the top contenders, 
     ]
     audio_files = await asyncio.gather(*tasks)
 
+    # Filter out any None values safely
+    valid_audio_files = [f for f in audio_files if f is not None]
+    if len(valid_audio_files) < len(sections):
+        await text_channel.send("⚠️ *Notice: Some audio tracks could not be synthesized. Proceeding with available voice tracks.*")
+
     # --- 5. LIVE BROADCAST EXECUTION ---
     try:
         # Act 1: Intro Speech (Intro Fanfare BGM)
         await text_channel.send("✨ **THE EVOLVERS GRAND FINAL BROADCAST IS NOW LIVE!** 🎙️")
-        await play_audio_file(vc, audio_files[0])
+        if len(audio_files) > 0 and audio_files[0]:
+            await play_audio_file(vc, audio_files[0])
         await asyncio.sleep(0.3)
 
         # Act 2: Staff Juries (Jury Tension Beat BGM)
@@ -695,7 +693,7 @@ Deliver an explosive climax. Build maximum suspense between the top contenders, 
             sorted_ballot = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
             
             # Voice announces points with suspenseful pause
-            if section_index < len(audio_files):
+            if section_index < len(audio_files) and audio_files[section_index]:
                 await play_audio_file(vc, audio_files[section_index])
                 section_index += 1
             
@@ -711,7 +709,7 @@ Deliver an explosive climax. Build maximum suspense between the top contenders, 
 
         # Act 4: Public Televotes (High-Stakes Televote Pulse BGM)
         await text_channel.send("🗳️ **Now Announcing the Public Member Televotes!**")
-        if section_index < len(audio_files):
+        if section_index < len(audio_files) and audio_files[section_index]:
             await play_audio_file(vc, audio_files[section_index])
             section_index += 1
 
@@ -724,7 +722,7 @@ Deliver an explosive climax. Build maximum suspense between the top contenders, 
         await text_channel.send("🥁 **AND THE WINNER OF EVOLVERS IS...**")
         
         # Audio plays suspenseful coronation & pause
-        if section_index < len(audio_files):
+        if section_index < len(audio_files) and audio_files[section_index]:
             await play_audio_file(vc, audio_files[section_index])
 
         # Final Embed and Congratulations posted after voice finishes
