@@ -1,21 +1,19 @@
 import os
 import asyncio
 import uuid
-import traceback
+import wave
+import base64
 import subprocess
 from threading import Thread
 from flask import Flask
 
 import discord
-import wave
-import edge_tts
-import base64
 from discord import app_commands
 from discord.ext import commands
-from google.genai import types
 
 # --- Google GenAI SDK ---
 from google import genai
+from google.genai import types
 
 # --- CONFIGURATION ---
 STAFF_ROLE_ID = 1449084902539657288  
@@ -23,17 +21,21 @@ HR_ROLE_ID = 1460385491261194464
 
 EUROVISION_POINTS = [12, 10, 8, 7, 6, 5, 4, 3, 2, 1]
 
-# --- BACKGROUND MUSIC PATHS (Place files in a /music folder or your root directory) ---
+# Background music files (Place inside a /music folder or bot directory)
 BGM_FILES = {
     "intro": "music/bgm_intro.mp3",       # Grand Eurovision fanfare
     "jury": "music/bgm_jury.mp3",         # Tense, rhythmic jury beat
-    "televote": "music/bgm_televote.mp3", # Escalating, high-stakes pulse
-    "winner": "music/bgm_winner.mp3"      # Celebratory victory theme
+    "televote": "music/bgm_televote.mp3", # Escalating pulse
+    "winner": "music/bgm_winner.mp3"      # Victory theme
 }
+
+GEMINI_VOICE_NAME = "Achird"
+TTS_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash"]
 
 # Initialize Gemini Client
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
 
 class EurovisionBot(commands.Bot):
     def __init__(self):
@@ -48,17 +50,19 @@ class EurovisionBot(commands.Bot):
         @self.tree.error
         async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
             if isinstance(error, app_commands.errors.CheckFailure):
-                await interaction.response.send_message(
-                    "❌ **Permission Denied**: This command can only be used by server Staff or HR.", 
-                    ephemeral=True
-                )
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ **Permission Denied**: This command can only be used by server Staff or HR.", 
+                        ephemeral=True
+                    )
             else:
-                print(f"Command Error: {error}")
+                print(f"[Command Error]: {error}")
 
         await self.tree.sync()
         print("Slash commands synced.")
 
 bot = EurovisionBot()
+
 
 def is_staff():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -75,10 +79,12 @@ def is_staff():
         return any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles)
     return app_commands.check(predicate)
 
+
 def get_initial_points(candidate_count):
     if candidate_count < 10:
         return EUROVISION_POINTS[:candidate_count]
     return EUROVISION_POINTS.copy()
+
 
 def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_members=False):
     title = f"🏆 Poll: {poll_data['title']} (ID: {poll_id})"
@@ -109,7 +115,7 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
     if poll_data["status"] == "members_voting":
         status_text += "🟢 Public Member Voting Open"
     elif poll_data["status"] == "staff_voting":
-        status_text += "🟡 Secret Staff Jury Voting in Progress"
+        status_text += "🟡 Staff Jury Voting in Progress"
     elif poll_data["status"] == "live_show":
         status_text += "🎙️ Live Grand Final in Progress!"
     else:
@@ -119,19 +125,16 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
     return embed
 
 
-# --- GEMINI 3.1 FLASH TTS CONFIGURATION ---
-GEMINI_VOICE_NAME = "Achird"
-TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+# --- AUDIO SYNTHESIS & MIXING ---
 
 def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.20) -> str:
-    """Mixes background music under the TTS speech using FFmpeg with volume ducking."""
+    """Mixes background music under Achird's TTS speech using FFmpeg ducking."""
     bgm_path = BGM_FILES.get(bgm_key)
     if not bgm_path or not os.path.exists(bgm_path):
-        return tts_wav_path  # Return raw speech if no BGM file is present
+        return tts_wav_path
 
     mixed_output_path = f"mixed_{uuid.uuid4().hex[:8]}.wav"
     try:
-        # Loop BGM infinitely, lower its volume to duck under voice, and cut when TTS ends
         cmd = [
             "ffmpeg", "-y",
             "-i", tts_wav_path,
@@ -143,7 +146,6 @@ def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.20
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         
-        # Clean up unmixed voice file
         if os.path.exists(tts_wav_path):
             os.remove(tts_wav_path)
             
@@ -153,17 +155,21 @@ def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.20
         return tts_wav_path
 
 
-async def synthesize_tts_file(text: str, bgm_phase: str = None) -> str:
-    """Generates audio file with Achird voice and mixes phase background music."""
-    if not text.strip():
+async def synthesize_achird_tts(text: str, bgm_phase: str = None, retries: int = 3) -> str:
+    """Strictly synthesizes voice audio with Gemini's Achird voice and mixes background music."""
+    if not text or not text.strip():
         return None
-        
-    temp_wav = f"gemini_tts_{uuid.uuid4().hex}.wav"
-    audio_generated = False
 
-    if ai_client:
-        tagged_text = f"[dramatic, game-show host energy] {text}"
-        
+    if not ai_client:
+        raise ValueError("GEMINI_API_KEY environment variable is not configured.")
+
+    clean_text = text.replace("*", "").replace("#", "").replace("[", "").replace("]", "").strip()
+    tagged_text = f"[dramatic, grand eurovision host voice] {clean_text}"
+
+    temp_wav = f"gemini_achird_{uuid.uuid4().hex}.wav"
+    audio_bytes = None
+
+    for attempt in range(1, retries + 1):
         for model in TTS_MODELS:
             try:
                 response = await ai_client.aio.models.generate_content(
@@ -180,75 +186,65 @@ async def synthesize_tts_file(text: str, bgm_phase: str = None) -> str:
                         )
                     )
                 )
-                
+
                 if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                     for part in response.candidates[0].content.parts:
                         if part.inline_data and part.inline_data.data:
-                            pcm_data = part.inline_data.data
-                            if isinstance(pcm_data, str):
-                                pcm_data = base64.b64decode(pcm_data)
-                                
-                            with wave.open(temp_wav, "wb") as wf:
-                                wf.setnchannels(1)
-                                wf.setsampwidth(2)
-                                wf.setframerate(24000)
-                                wf.writeframes(pcm_data)
-                                
-                            audio_generated = True
+                            raw_data = part.inline_data.data
+                            if isinstance(raw_data, str):
+                                audio_bytes = base64.b64decode(raw_data)
+                            else:
+                                audio_bytes = raw_data
                             break
-                            
-                if audio_generated:
+
+                if audio_bytes:
                     break
             except Exception as e:
-                print(f"[Gemini 3.1 TTS ({model}) Warning]: {e}")
+                print(f"[Achird TTS {model} Attempt {attempt} Error]: {e}")
 
-    # Fallback to Edge-TTS only if Gemini fails
-    if not audio_generated or not os.path.exists(temp_wav):
-        try:
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice="en-US-GuyNeural",
-                rate="+10%",
-                pitch="+4Hz"
-            )
-            await communicate.save(temp_wav)
-            audio_generated = True
-        except Exception as e:
-            print(f"[TTS Fallback Error]: {e}")
+        if audio_bytes:
+            break
+        await asyncio.sleep(2 * attempt)
 
-    if audio_generated and os.path.exists(temp_wav):
-        if bgm_phase:
-            # Mix background music asynchronously in thread to avoid blocking
-            return await asyncio.to_thread(mix_audio_with_bgm, temp_wav, bgm_phase)
-        return temp_wav
+    if not audio_bytes:
+        raise RuntimeError(f"Failed to generate Achird TTS audio after {retries} attempts.")
 
-    return None
+    # Write 24kHz mono 16-bit PCM WAV
+    with wave.open(temp_wav, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(audio_bytes)
+
+    if bgm_phase:
+        return await asyncio.to_thread(mix_audio_with_bgm, temp_wav, bgm_phase)
+
+    return temp_wav
 
 
 async def play_audio_file(voice_client: discord.VoiceClient, filepath: str):
-    """Streams the mixed audio file to Discord voice."""
+    """Accurately streams the audio file to Discord voice without cutting off."""
     if not filepath or not os.path.exists(filepath):
         return
-        
-    try:
-        audio_source = discord.FFmpegPCMAudio(filepath)
-        voice_client.play(audio_source)
-        
-        while voice_client.is_playing():
-            await asyncio.sleep(0.08)
-    except Exception as e:
-        print(f"Error streaming to voice channel: {e}")
+
+    finished_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def after_playing(error):
+        if error:
+            print(f"[Playback Error]: {error}")
+        loop.call_soon_threadsafe(finished_event.set)
+
+    audio_source = discord.FFmpegPCMAudio(filepath)
+    voice_client.play(audio_source, after=after_playing)
+    await finished_event.wait()
 
 
-# --- CANDIDATE SETUP UI ---
+# --- UI VIEWS ---
 
 class ServerMemberSelect(discord.ui.UserSelect):
     def __init__(self):
-        super().__init__(
-            placeholder="Select members to add to the candidate pool...",
-            min_values=1,
-            max_values=25
-        )
+        super().__init__(placeholder="Select members to add as candidates...", min_values=1, max_values=25)
 
     async def callback(self, interaction: discord.Interaction):
         for user in self.values:
@@ -256,12 +252,10 @@ class ServerMemberSelect(discord.ui.UserSelect):
                 self.view.selected_users.append(user)
         
         candidate_list = "\n".join([f"• {user.display_name}" for user in self.view.selected_users])
-        
         await interaction.response.edit_message(
             content=(
-                f"✨ **Configure Your Candidates**\n\n"
-                f"**Selected Candidates ({len(self.view.selected_users)}):**\n{candidate_list}\n\n"
-                "You can select more candidates or click **Continue** to finalize."
+                f"✨ **Configure Candidates ({len(self.view.selected_users)} selected):**\n"
+                f"{candidate_list}\n\nSelect more or click **Continue** to finalize."
             ),
             view=self.view
         )
@@ -283,7 +277,6 @@ class PollSetupView(discord.ui.View):
             return
 
         candidate_list = [member.display_name for member in self.selected_users]
-        
         self.bot.polls[self.poll_id] = {
             "title": self.title,
             "type": self.poll_type,
@@ -306,15 +299,13 @@ class PollSetupView(discord.ui.View):
         self.bot.polls[self.poll_id]["message_id"] = message.id
 
 
-# --- ACTIVE SCOREBOARD VIEWS ---
-
 class PollBoardView(discord.ui.View):
     def __init__(self, poll_id, bot_instance):
         super().__init__(timeout=None)
         self.poll_id = poll_id
         self.bot = bot_instance
 
-    @discord.ui.button(label="Vote (3 Choices)", style=discord.ButtonStyle.primary, emoji="🗳️", custom_id="vote_button_persistent")
+    @discord.ui.button(label="Vote (3 Choices)", style=discord.ButtonStyle.primary, emoji="🗳️", custom_id="vote_btn")
     async def vote_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.poll_id not in self.bot.polls:
             await interaction.response.send_message("❌ Poll data not found.", ephemeral=True)
@@ -322,27 +313,23 @@ class PollBoardView(discord.ui.View):
         
         poll_data = self.bot.polls[self.poll_id]
         if poll_data["status"] != "members_voting":
-            await interaction.response.send_message("❌ Public member voting is closed.", ephemeral=True)
+            await interaction.response.send_message("❌ Member voting is closed.", ephemeral=True)
             return
 
         if interaction.guild:
             member = interaction.guild.get_member(interaction.user.id)
             if member and any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
-                await interaction.response.send_message(
-                    "❌ **Staff & HR Cannot Vote in Public Voting!**\nAs a member of Staff/HR, you will cast your points during the **Staff Jury** voting phase instead.",
-                    ephemeral=True
-                )
+                await interaction.response.send_message("❌ Staff & HR vote during the hidden Staff Jury phase.", ephemeral=True)
                 return
 
         user_id = str(interaction.user.id)
         if user_id in poll_data["member_votes"]:
-            await interaction.response.send_message("❌ **You have already voted!**", ephemeral=True)
+            await interaction.response.send_message("❌ You have already voted!", ephemeral=True)
             return
 
         view = VotingView(self.poll_id, user_id, self.bot)
         await interaction.response.send_message(
-            "🗳️ **Welcome to the Voting Booth!**\n"
-            "Select **up to 3 candidates**. Each candidate will receive 1 point.",
+            "🗳️ Select **up to 3 candidates**. Each candidate will receive 1 point.",
             view=view, 
             ephemeral=True
         )
@@ -354,7 +341,7 @@ class StaffBoardView(discord.ui.View):
         self.poll_id = poll_id
         self.bot = bot_instance
 
-    @discord.ui.button(label="Staff Jury Vote", style=discord.ButtonStyle.secondary, emoji="🎙️", custom_id="staff_vote_btn_persistent")
+    @discord.ui.button(label="Staff Jury Vote", style=discord.ButtonStyle.secondary, emoji="🎙️", custom_id="staff_vote_btn")
     async def staff_vote_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.poll_id not in self.bot.polls:
             await interaction.response.send_message("❌ Poll data not found.", ephemeral=True)
@@ -362,30 +349,26 @@ class StaffBoardView(discord.ui.View):
         
         poll_data = self.bot.polls[self.poll_id]
         if poll_data["status"] != "staff_voting":
-            await interaction.response.send_message("❌ Staff voting is not active.", ephemeral=True)
+            await interaction.response.send_message("❌ Staff jury voting is not active.", ephemeral=True)
             return
 
         member = interaction.guild.get_member(interaction.user.id)
         if not member or not any(role.id in (STAFF_ROLE_ID, HR_ROLE_ID) for role in member.roles):
-            await interaction.response.send_message("❌ **Permission Denied**: This phase is reserved for Staff & HR.", ephemeral=True)
+            await interaction.response.send_message("❌ This phase is reserved for Staff & HR.", ephemeral=True)
             return
 
         user_id = str(interaction.user.id)
         if user_id in poll_data["staff_votes"]:
-            await interaction.response.send_message("❌ **You have already submitted your jury ballot!**", ephemeral=True)
+            await interaction.response.send_message("❌ You have already submitted your jury ballot.", ephemeral=True)
             return
 
-        staff_name = member.display_name
-        view = StaffVotingView(self.poll_id, user_id, staff_name, self.bot)
+        view = StaffVotingView(self.poll_id, user_id, member.display_name, self.bot)
         await interaction.response.send_message(
-            f"🎙️ **Welcome {staff_name} to the Staff Jury Booth!**\n"
-            "Assign all your Eurovision points. Your ballot will be announced live on stage during the grand final!",
+            f"🎙️ Welcome **{member.display_name}**! Assign your Eurovision points. Your ballot will be revealed live during the show.",
             view=view, 
             ephemeral=True
         )
 
-
-# --- VOTING VIEWS ---
 
 class CandidateSelect(discord.ui.Select):
     def __init__(self, candidates):
@@ -394,6 +377,7 @@ class CandidateSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         await self.view.handle_candidate_selection(interaction, self.values[0])
+
 
 class VotingView(discord.ui.View):
     def __init__(self, poll_id, user_id, bot_instance):
@@ -406,7 +390,6 @@ class VotingView(discord.ui.View):
         self.available_candidates = poll_data["candidates"].copy()
         self.max_votes = min(3, len(self.available_candidates))
         self.current_ballot = {} 
-
         self.update_to_candidate_select()
 
     def update_to_candidate_select(self):
@@ -420,10 +403,9 @@ class VotingView(discord.ui.View):
         if len(self.current_ballot) >= self.max_votes or not self.available_candidates:
             self.clear_items()
             self.bot.polls[self.poll_id]["member_votes"][self.user_id] = self.current_ballot
-            
             ballot_summary = "\n".join([f"• **1 pt** ➡️ {c}" for c in self.current_ballot.keys()])
             await interaction.response.edit_message(
-                content=f"✅ **Voting Complete!** Your submitted ballot:\n\n{ballot_summary}",
+                content=f"✅ **Ballot Submitted!**\n\n{ballot_summary}",
                 view=None
             )
         else:
@@ -437,10 +419,11 @@ class VotingView(discord.ui.View):
 class StaffCandidateSelect(discord.ui.Select):
     def __init__(self, candidates):
         options = [discord.SelectOption(label=c, value=c) for c in candidates]
-        super().__init__(placeholder="Select a candidate to award points...", options=options)
+        super().__init__(placeholder="Select candidate to award points...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         await self.view.handle_candidate_selection(interaction, self.values[0])
+
 
 class StaffPointSelect(discord.ui.Select):
     def __init__(self, candidate, available_points):
@@ -450,6 +433,7 @@ class StaffPointSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         await self.view.handle_point_selection(interaction, self.candidate_name, int(self.values[0]))
+
 
 class StaffVotingView(discord.ui.View):
     def __init__(self, poll_id, user_id, staff_name, bot_instance):
@@ -463,7 +447,6 @@ class StaffVotingView(discord.ui.View):
         self.available_candidates = poll_data["candidates"].copy()
         self.available_points = get_initial_points(len(self.available_candidates))
         self.current_ballot = {}
-
         self.update_to_candidate_select()
 
     def update_to_candidate_select(self):
@@ -481,22 +464,20 @@ class StaffVotingView(discord.ui.View):
         self.available_points.remove(points)
         
         poll_data = self.bot.polls[self.poll_id]
-        
         if not self.available_candidates or not self.available_points:
             self.clear_items()
             poll_data["staff_votes"][self.user_id] = {
                 "name": self.staff_name,
                 "ballot": self.current_ballot
             }
-            
             await interaction.response.edit_message(
-                content="✅ **Jury Ballot Recorded!** Your votes are safely stored and will be revealed during the live show.",
+                content="✅ **Jury Ballot Recorded!** Your points are saved for the live broadcast.",
                 view=None
             )
         else:
             self.update_to_candidate_select()
             await interaction.response.edit_message(
-                content=f"✅ Assigned **{points} points** to **{candidate}**.\n\nSelect next candidate:",
+                content=f"✅ Assigned **{points} points** to **{candidate}**.\nSelect next candidate:",
                 view=self
             )
 
@@ -515,6 +496,7 @@ async def create_poll(interaction: discord.Interaction, title: str, poll_type: s
     view = PollSetupView(poll_id, title, poll_type, bot)
     await interaction.response.send_message("✨ **Configure Candidates** via dropdown, then click Continue.", view=view, ephemeral=True)
 
+
 @bot.tree.command(name="start_staff_voting", description="Close member voting and open hidden staff jury voting.")
 @is_staff()
 async def start_staff_voting(interaction: discord.Interaction, poll_id: str):
@@ -528,9 +510,10 @@ async def start_staff_voting(interaction: discord.Interaction, poll_id: str):
     channel = bot.get_channel(poll_data["channel_id"])
     message = await channel.fetch_message(poll_data["message_id"])
     await message.edit(embed=embed, view=StaffBoardView(poll_id, bot))
-    await interaction.response.send_message("✅ Public member voting is closed. Staff jury voting is now open (votes remain hidden until the show!).")
+    await interaction.response.send_message("✅ Public voting closed. Staff jury voting is now open (hidden until broadcast).")
 
-@bot.tree.command(name="start_live_show", description="Host the Eurovision Grand Final via Voice Channel with Gemini!")
+
+@bot.tree.command(name="start_live_show", description="Host the Eurovision Grand Final via Voice Channel with Achird!")
 @app_commands.describe(poll_id="The ID of the poll", voice_channel="Voice channel where the show will be hosted")
 @is_staff()
 async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_channel: discord.VoiceChannel):
@@ -540,27 +523,16 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     
     poll_data = bot.polls[poll_id]
     poll_data["status"] = "live_show"
-    await interaction.response.send_message(f"🎙️ **Preparing the Grand Final Broadcast in {voice_channel.mention}...**")
+    
+    # Acknowledge immediately
+    await interaction.response.send_message(f"⏳ **Preparing all broadcast scenes with Achird voice... Please wait.**")
+    progress_msg = await interaction.original_response()
 
-    # Connect to Voice Channel
-    try:
-        vc = await voice_channel.connect()
-    except Exception:
-        vc = interaction.guild.voice_client
-
-    text_channel = interaction.channel
-
-    # --- 1. CALCULATE ALL TOTALS IN ADVANCE ---
-    staff_breakdown_text = ""
+    # --- 1. CALCULATE SCORE STANDINGS ---
     staff_total_points = {c: 0 for c in poll_data["candidates"]}
     for u_id, s_data in poll_data["staff_votes"].items():
-        name = s_data["name"]
-        ballot = s_data["ballot"]
-        for c, pts in ballot.items():
+        for c, pts in s_data["ballot"].items():
             staff_total_points[c] += pts
-        sorted_b = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
-        ballot_str = ", ".join([f"{c}: {p}pts" for c, p in sorted_b])
-        staff_breakdown_text += f"\n- Juror '{name}': {ballot_str}"
 
     televote_totals = {c: 0 for c in poll_data["candidates"]}
     for u_id, b in poll_data["member_votes"].items():
@@ -570,162 +542,130 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
 
     combined_scores = {c: staff_total_points.get(c, 0) + televote_totals.get(c, 0) for c in poll_data["candidates"]}
     sorted_final = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
-    
     winner_name = sorted_final[0][0] if sorted_final else "Nobody"
     winner_points = sorted_final[0][1] if sorted_final else 0
-    runner_up = sorted_final[1][0] if len(sorted_final) > 1 else None
 
-    # --- 2. GENERATE DRAMATIC SCRIPT ---
-    prompt = f'''
-You are the charismatic, dramatic, and iconic Game Show and Eurovision Host for tonight's Grand Final!
-Event Name: {poll_data['title']}
+    # --- 2. BUILD STRUCTURED BROADCAST SCENES ---
+    scenes = []
 
-STANDINGS DATA:
-- All Candidates: {poll_data['candidates']}
-- Staff Juries and exact votes: {staff_breakdown_text}
-- Public Member Televote results in ascending order: {sorted_televotes}
-- DEFINITIVE WINNER: {winner_name} with {winner_points} points!
-- RUNNER UP: {runner_up}
-
-INSTRUCTIONS:
-Write a rich, energetic, and comprehensive broadcast script for text-to-speech.
-Use expressive language, suspenseful pacing, and Eurovision game-show hype.
-Do NOT use asterisks, markdown bolding, emojis, brackets, or stage directions. Deliver ONLY spoken words.
-Divide each act using the exact delimiter ---SECTION---.
-
-SECTION 1 (PROLOGUE AND WELCOME):
-Give a grand Eurovision opening. Welcome the server, praise the nominees, hype up the community, and set the stakes for tonight's crown.
-
-SECTIONS 2 TO N (ONE DETAILED SECTION PER STAFF JURY):
-For each staff juror, create a complete segment:
-- Greet and introduce the juror.
-- Mention some of their lower or mid points.
-- Build dramatic suspense and announce their twelve points winner clearly.
-
-NEXT SECTION (PUBLIC TELEVOTES):
-Announce the public member televotes. Remind the audience that the televotes can change everything. Reveal points candidate by candidate from lowest to highest with rising tension.
-
-FINAL SECTION (GRAND WINNER CORONATION):
-Deliver an explosive, emotional climax.
-- Build maximum suspense between the top contenders.
-- Explicitly announce the winner {winner_name} as the champion.
-- Celebrate their victory with grand fanfare, give a heartfelt thank you to everyone who voted, and sign off the broadcast.
-'''
-
-    host_script = ""
-    if ai_client:
-        try:
-            response = await ai_client.aio.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-            host_script = response.text
-        except Exception as e:
-            print(f"Gemini API Error: {e}")
-
-    # Fallback script
-    if host_script and "---SECTION---" in host_script:
-        sections = [s.strip() for s in host_script.split("---SECTION---") if s.strip()]
-    else:
-        sections = [
-            f"Good evening Europe, good evening world, and welcome to the Grand Final of {poll_data['title']}! What an incredible month it has been. Tonight, one of our amazing nominees will be crowned champion. Let the voting begin!"
-        ]
-        for u_id, s_data in poll_data["staff_votes"].items():
-            name = s_data["name"]
-            sorted_b = sorted(s_data["ballot"].items(), key=lambda x: x[1], reverse=True)
-            top_candidate = sorted_b[0][0] if sorted_b else "the leader"
-            sections.append(
-                f"Let us turn our attention to our esteemed jury member, {name}. The tension in the arena is palpable. And {name}'s coveted twelve points go to... {top_candidate}!"
-            )
-        sections.append(
-            "The jury votes are locked in, but this competition is far from over. It is now time for the public member televotes! Every single vote counts."
+    # Scene 1: Intro
+    scenes.append({
+        "type": "intro",
+        "bgm": "intro",
+        "script": (
+            f"Good evening Europe, good evening world, and welcome to the Grand Final of {poll_data['title']}! "
+            f"Tonight, we find out who takes the crown. Let the voting begin!"
         )
-        sections.append(
-            f"Ladies and gentlemen, the moment of truth has arrived! With an incredible total score of {winner_points} points, the winner of Member of the Month is... {winner_name}! A massive congratulations to {winner_name}, and thank you all for watching. Goodnight!"
+    })
+
+    # Scene 2 to N: Each Staff Juror
+    for jury_data in poll_data["staff_votes"].values():
+        name = jury_data["name"]
+        sorted_b = sorted(jury_data["ballot"].items(), key=lambda x: x[1], reverse=True)
+        twelve_pts_candidate = sorted_b[0][0] if sorted_b else "the nominee"
+        
+        scenes.append({
+            "type": "jury",
+            "bgm": "jury",
+            "jury_data": jury_data,
+            "script": (
+                f"We now cross live to our esteemed jury member, {name}. "
+                f"Thank you, {name}. And {name}'s coveted twelve points go to... {twelve_pts_candidate}!"
+            )
+        })
+
+    # Scene N+1: Televote Announcement
+    scenes.append({
+        "type": "televote",
+        "bgm": "televote",
+        "script": (
+            "The jury votes are locked in. But this competition is far from over! "
+            "It is now time for the public member televotes. Every single vote counts!"
         )
+    })
 
-    # --- 3. MAP SECTIONS TO SPECIFIC BGM PHASES ---
-    # Phase mapping: [0] = intro, [1:-2] = jury, [-2] = televote, [-1] = winner
-    num_sections = len(sections)
-    phase_mapping = []
-    
-    for i in range(num_sections):
-        if i == 0:
-            phase_mapping.append("intro")
-        elif i == num_sections - 2:
-            phase_mapping.append("televote")
-        elif i == num_sections - 1:
-            phase_mapping.append("winner")
-        else:
-            phase_mapping.append("jury")
+    # Scene N+2: Grand Winner
+    scenes.append({
+        "type": "winner",
+        "bgm": "winner",
+        "script": (
+            f"Ladies and gentlemen, the moment of truth has arrived! "
+            f"With a spectacular total of {winner_points} points, the winner of {poll_data['title']} is... {winner_name}! "
+            f"Congratulations to {winner_name}, and thank you all for being part of tonight's grand final! Goodnight!"
+        )
+    })
 
-    # --- 4. PRE-GENERATE ALL AUDIO WITH PHASE-MATCHED BGM IN PARALLEL ---
-    await text_channel.send("🎙️ *Synthesizing host broadcast & mixing Eurovision background tracks...*")
-    
-    tasks = [
-        synthesize_tts_file(sec, bgm_phase=phase)
-        for sec, phase in zip(sections, phase_mapping)
-    ]
-    audio_files = await asyncio.gather(*tasks)
-
-    # --- 5. LIVE BROADCAST EXECUTION ---
+    # --- 3. PRE-SYNTHESIZE ALL SCENES (STRICTLY ACHIRD) ---
+    generated_audio = []
     try:
-        # Act 1: Intro Speech (Intro Fanfare BGM)
+        for idx, sc in enumerate(scenes, 1):
+            await progress_msg.edit(content=f"🎙️ **Synthesizing Scene {idx}/{len(scenes)} with Achird voice & mixing BGM...**")
+            audio_path = await synthesize_achird_tts(sc["script"], bgm_phase=sc["bgm"])
+            generated_audio.append(audio_path)
+            sc["audio_file"] = audio_path
+
+        await progress_msg.edit(content=f"✅ **All scenes ready! Connecting to {voice_channel.mention} to start the broadcast...**")
+
+        # --- 4. CONNECT TO VOICE CHANNEL ---
+        try:
+            vc = await voice_channel.connect()
+        except Exception:
+            vc = interaction.guild.voice_client
+
+        text_channel = interaction.channel
+
+        # --- 5. EXECUTE LIVE BROADCAST ---
         await text_channel.send("✨ **THE GRAND FINAL BROADCAST IS NOW LIVE!** 🎙️")
-        await play_audio_file(vc, audio_files[0])
-        await asyncio.sleep(0.5)
 
-        # Act 2: Staff Juries (Jury Tension Beat BGM)
-        staff_juries = list(poll_data["staff_votes"].values())
-        section_index = 1
-        
-        for jury in staff_juries:
-            jury_name = jury["name"]
-            ballot = jury["ballot"]
-            sorted_ballot = sorted(ballot.items(), key=lambda x: x[1], reverse=True)
-            
-            # Voice announces points with jury music underneath
-            if section_index < len(audio_files):
-                await play_audio_file(vc, audio_files[section_index])
-                section_index += 1
-            
-            # Text ballot revealed after the voice finishes
-            ballot_display = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_ballot])
-            await text_channel.send(f"🎙️ **Jury Ballot from {jury_name}:**\n{ballot_display}")
-            await asyncio.sleep(0.6)
+        for sc in scenes:
+            scene_type = sc["type"]
+            audio_file = sc["audio_file"]
 
-        # Act 3: Staff Scoreboard Standings
-        embed_staff = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=False)
-        await text_channel.send("📊 **Scoreboard Standings after Jury Voting:**", embed=embed_staff)
-        await asyncio.sleep(0.8)
+            if scene_type == "intro":
+                await play_audio_file(vc, audio_file)
+                await asyncio.sleep(0.5)
 
-        # Act 4: Public Televotes (High-Stakes Televote Pulse BGM)
-        await text_channel.send("🗳️ **Now Announcing the Public Member Televotes!**")
-        if section_index < len(audio_files):
-            await play_audio_file(vc, audio_files[section_index])
-            section_index += 1
+            elif scene_type == "jury":
+                await play_audio_file(vc, audio_file)
+                jury_info = sc["jury_data"]
+                sorted_ballot = sorted(jury_info["ballot"].items(), key=lambda x: x[1], reverse=True)
+                ballot_display = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_ballot])
+                await text_channel.send(f"🎙️ **Jury Ballot from {jury_info['name']}:**\n{ballot_display}")
+                await asyncio.sleep(0.5)
 
-        televote_summary = "\n".join([f"• **{pts} pts** ➡️ {c}" for c, pts in sorted_televotes])
-        await text_channel.send(f"📊 **Public Televote Points Added:**\n{televote_summary}")
-        await asyncio.sleep(0.8)
+            elif scene_type == "televote":
+                embed_staff = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=False)
+                await text_channel.send("📊 **Standings After Staff Jury Voting:**", embed=embed_staff)
+                await asyncio.sleep(0.8)
+                
+                await text_channel.send("🗳️ **Now Announcing the Public Member Televotes!**")
+                await play_audio_file(vc, audio_file)
+                
+                televote_summary = "\n".join([f"• **{pts} pts** ➡️ {c}" for c, pts in sorted_televotes])
+                await text_channel.send(f"📊 **Public Televote Points Added:**\n{televote_summary}")
+                await asyncio.sleep(0.8)
 
-        # Act 5: Grand Winner Coronation (Celebratory Winner Fanfare BGM)
-        poll_data["status"] = "closed"
-        await text_channel.send("🥁 **AND THE WINNER IS...**")
-        
-        if section_index < len(audio_files):
-            await play_audio_file(vc, audio_files[section_index])
+            elif scene_type == "winner":
+                poll_data["status"] = "closed"
+                await text_channel.send("🥁 **AND THE WINNER IS...**")
+                await play_audio_file(vc, audio_file)
 
-        # Final Embed and Congratulations
-        embed_final = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=True)
-        await text_channel.send(f"🏆 **🎉 CONGRATULATIONS TO OUR WINNER: {winner_name}! 🎉**", embed=embed_final)
+                embed_final = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=True)
+                await text_channel.send(f"🏆 **🎉 CONGRATULATIONS TO OUR WINNER: {winner_name}! 🎉**", embed=embed_final)
 
-        await asyncio.sleep(3.0)
-        await vc.disconnect()
+        await asyncio.sleep(2.5)
+        if vc and vc.is_connected():
+            await vc.disconnect()
+
+    except Exception as e:
+        await text_channel.send(f"❌ An error occurred during the live broadcast: `{e}`")
+        print(f"[Live Show Error]: {e}")
+        if 'vc' in locals() and vc and vc.is_connected():
+            await vc.disconnect()
 
     finally:
-        # Clean up temporary mixed WAV files
-        for f in audio_files:
+        # Clean up temporary audio files
+        for f in generated_audio:
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
