@@ -125,22 +125,48 @@ def generate_scoreboard_embed(poll_id, poll_data, reveal_staff=False, reveal_mem
     return embed
 
 
-# --- AUDIO SYNTHESIS & MIXING ---
+# --- AUDIO SYNTHESIS & BROADCAST MIXING ---
 
-def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.20) -> str:
-    """Mixes background music under Achird's TTS speech using FFmpeg ducking."""
+def get_audio_duration(wav_path: str) -> float:
+    """Calculates duration in seconds of a WAV file."""
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            return frames / float(rate)
+    except Exception:
+        return 5.0
+
+def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.22) -> str:
+    """
+    Seamlessly mixes BGM under Achird's speech with:
+    1. Smooth 0.3s fade-in.
+    2. Ducked volume under speech.
+    3. 1.5s music tail after voice ends with a gentle fade-out so it never cuts abruptly.
+    """
     bgm_path = BGM_FILES.get(bgm_key)
     if not bgm_path or not os.path.exists(bgm_path):
         return tts_wav_path
 
+    voice_duration = get_audio_duration(tts_wav_path)
+    total_duration = voice_duration + 1.5
+    fade_start = max(0.1, total_duration - 1.2)
+
     mixed_output_path = f"mixed_{uuid.uuid4().hex[:8]}.wav"
     try:
+        # Voice padded with 1.5s silence; BGM faded in and out seamlessly
+        filter_complex = (
+            f"[0:a]volume=1.0,apad=pad_dur=1.5[voice];"
+            f"[1:a]volume={bgm_volume},afade=t=in:st=0:d=0.3,afade=t=out:st={fade_start:.2f}:d=1.2[music];"
+            f"[voice][music]amix=inputs=2:duration=first:dropout_transition=0[out]"
+        )
+
         cmd = [
             "ffmpeg", "-y",
             "-i", tts_wav_path,
             "-stream_loop", "-1", "-i", bgm_path,
-            "-filter_complex",
-            f"[0:a]volume=1.0[voice];[1:a]volume={bgm_volume}[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2",
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
             "-c:a", "pcm_s16le",
             mixed_output_path
         ]
@@ -163,8 +189,9 @@ async def synthesize_achird_tts(text: str, bgm_phase: str = None, retries: int =
     if not ai_client:
         raise ValueError("GEMINI_API_KEY environment variable is not configured.")
 
+    # Clean non-spoken markdown while preserving pauses & punctuation
     clean_text = text.replace("*", "").replace("#", "").replace("[", "").replace("]", "").strip()
-    tagged_text = f"[dramatic, grand eurovision host voice] {clean_text}"
+    tagged_text = f"[dramatic, charismatic Eurovision game-show host. Speak with energy, building intense suspense and taking clear dramatic pauses at ellipses] {clean_text}"
 
     temp_wav = f"gemini_achird_{uuid.uuid4().hex}.wav"
     audio_bytes = None
@@ -524,7 +551,6 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     poll_data = bot.polls[poll_id]
     poll_data["status"] = "live_show"
     
-    # Acknowledge immediately
     await interaction.response.send_message(f"⏳ **Preparing all broadcast scenes with Achird voice... Please wait.**")
     progress_msg = await interaction.original_response()
 
@@ -545,7 +571,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     winner_name = sorted_final[0][0] if sorted_final else "Nobody"
     winner_points = sorted_final[0][1] if sorted_final else 0
 
-    # --- 2. BUILD STRUCTURED BROADCAST SCENES ---
+    # --- 2. BUILD STRUCTURED BROADCAST SCENES WITH DRAMATIC SUSPENSE PAUSES ---
     scenes = []
 
     # Scene 1: Intro
@@ -554,11 +580,12 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
         "bgm": "intro",
         "script": (
             f"Good evening Europe, good evening world, and welcome to the Grand Final of {poll_data['title']}! "
-            f"Tonight, we find out who takes the crown. Let the voting begin!"
+            f"The atmosphere in the arena is electric. Tonight, one of our amazing nominees will be crowned champion. "
+            f"Let the Eurovision voting begin!"
         )
     })
 
-    # Scene 2 to N: Each Staff Juror
+    # Scene 2 to N: Each Staff Juror with dramatic 12-points pause
     for jury_data in poll_data["staff_votes"].values():
         name = jury_data["name"]
         sorted_b = sorted(jury_data["ballot"].items(), key=lambda x: x[1], reverse=True)
@@ -570,7 +597,8 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
             "jury_data": jury_data,
             "script": (
                 f"We now cross live to our esteemed jury member, {name}. "
-                f"Thank you, {name}. And {name}'s coveted twelve points go to... {twelve_pts_candidate}!"
+                f"Thank you for your service, {name}. The tension is building in the arena. "
+                f"And {name}'s coveted, decisive twelve points go to... ... ... ... ... ... ... {twelve_pts_candidate}!"
             )
         })
 
@@ -584,18 +612,19 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
         )
     })
 
-    # Scene N+2: Grand Winner
+    # Scene N+2: Grand Winner Coronation with intense climax suspense
     scenes.append({
         "type": "winner",
         "bgm": "winner",
         "script": (
-            f"Ladies and gentlemen, the moment of truth has arrived! "
-            f"With a spectacular total of {winner_points} points, the winner of {poll_data['title']} is... {winner_name}! "
-            f"Congratulations to {winner_name}, and thank you all for being part of tonight's grand final! Goodnight!"
+            f"Ladies and gentlemen, the moment of truth has finally arrived! "
+            f"The final points have been tallied. "
+            f"With an unbelievable total of {winner_points} points, the grand champion and winner of {poll_data['title']} is... ... ... ... ... ... ... ... {winner_name}! "
+            f"A massive congratulations to {winner_name}! Thank you all for an unforgettable night, and goodnight!"
         )
     })
 
-    # --- 3. PRE-SYNTHESIZE ALL SCENES (STRICTLY ACHIRD) ---
+    # --- 3. PRE-SYNTHESIZE ALL SCENES (STRICTLY ACHIRD + FADED BGM) ---
     generated_audio = []
     try:
         for idx, sc in enumerate(scenes, 1):
@@ -623,7 +652,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
 
             if scene_type == "intro":
                 await play_audio_file(vc, audio_file)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.6)
 
             elif scene_type == "jury":
                 await play_audio_file(vc, audio_file)
@@ -631,7 +660,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
                 sorted_ballot = sorted(jury_info["ballot"].items(), key=lambda x: x[1], reverse=True)
                 ballot_display = "\n".join([f"• **{p} pts** ➡️ {c}" for c, p in sorted_ballot])
                 await text_channel.send(f"🎙️ **Jury Ballot from {jury_info['name']}:**\n{ballot_display}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.6)
 
             elif scene_type == "televote":
                 embed_staff = generate_scoreboard_embed(poll_id, poll_data, reveal_staff=True, reveal_members=False)
