@@ -31,7 +31,12 @@ BGM_FILES = {
 }
 
 GEMINI_VOICE_NAME = "Achird"
-TTS_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash"]
+TTS_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview"
+]
 
 # Initialize Gemini Client
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -138,36 +143,8 @@ def get_audio_duration(wav_path: str) -> float:
     except Exception:
         return 4.0
 
-def create_silence_wav(duration: float, sample_rate: int = 24000) -> str:
-    """Creates a raw silent WAV file for natural dramatic pauses."""
-    silence_path = f"silence_{uuid.uuid4().hex[:8]}.wav"
-    num_frames = int(duration * sample_rate)
-    silence_data = b'\x00\x00' * num_frames
-    with wave.open(silence_path, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(silence_data)
-    return silence_path
-
-def concat_wav_files(wav_files: list, output_path: str):
-    """Concatenates raw PCM WAV audio files cleanly."""
-    valid_files = [f for f in wav_files if f and os.path.exists(f)]
-    if not valid_files:
-        return
-    with wave.open(output_path, 'wb') as outfile:
-        with wave.open(valid_files[0], 'rb') as first:
-            params = first.getparams()
-            outfile.setparams(params)
-        for f in valid_files:
-            with wave.open(f, 'rb') as infile:
-                outfile.writeframes(infile.readframes(infile.getnframes()))
-
 def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.22) -> str:
-    """
-    Seamlessly mixes BGM under speech with a smooth music tail and fade-out.
-    Uses -t and timeout to guarantee FFmpeg never freezes or deadlocks.
-    """
+    """Seamlessly mixes BGM under speech with a clean music tail and fade-out."""
     bgm_path = BGM_FILES.get(bgm_key)
     if not bgm_path or not os.path.exists(bgm_path):
         return tts_wav_path
@@ -195,7 +172,6 @@ def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.22
             mixed_output_path
         ]
         
-        # 15 second timeout to completely eliminate process hangs
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True)
         
         if os.path.exists(tts_wav_path):
@@ -209,23 +185,27 @@ def mix_audio_with_bgm(tts_wav_path: str, bgm_key: str, bgm_volume: float = 0.22
         print(f"[Audio Mixing Warning for {bgm_key}]: {e}")
         return tts_wav_path
 
-async def synthesize_single_speech(text: str, retries: int = 3) -> str:
-    """Synthesizes speech WAV using Achird voice with automatic retries."""
+async def synthesize_achird_speech(text: str, retries: int = 4) -> str:
+    """Synthesizes speech using Achird with exponential backoff on rate limits."""
     if not text or not text.strip():
         return None
 
-    clean_text = text.replace("*", "").replace("#", "").replace("[", "").replace("]", "").strip()
-    tagged_text = f"[dramatic, grand Eurovision game-show host. Speak with high energy and enthusiasm] {clean_text}"
+    if not ai_client:
+        raise ValueError("GEMINI_API_KEY environment variable is not configured.")
 
-    temp_wav = f"gemini_achird_{uuid.uuid4().hex}.wav"
+    clean_text = text.replace("*", "").replace("#", "").strip()
+    prompt = f"Please read the following text aloud with the energetic, charismatic, dramatic delivery of a Eurovision game show host. Pause with suspense before revealing the recipient: {clean_text}"
+
+    temp_wav = f"gemini_achird_{uuid.uuid4().hex[:8]}.wav"
     audio_bytes = None
+    last_error = None
 
     for attempt in range(1, retries + 1):
         for model in TTS_MODELS:
             try:
                 response = await ai_client.aio.models.generate_content(
                     model=model,
-                    contents=tagged_text,
+                    contents=prompt,
                     config=types.GenerateContentConfig(
                         response_modalities=["AUDIO"],
                         speech_config=types.SpeechConfig(
@@ -251,14 +231,19 @@ async def synthesize_single_speech(text: str, retries: int = 3) -> str:
                 if audio_bytes:
                     break
             except Exception as e:
-                print(f"[Achird TTS {model} Attempt {attempt} Error]: {e}")
+                last_error = e
+                print(f"[Gemini TTS {model} (Attempt {attempt})]: {e}")
 
         if audio_bytes:
             break
-        await asyncio.sleep(1.5 * attempt)
+        
+        # Exponential backoff if rate limited
+        backoff_time = 3 * attempt
+        print(f"Waiting {backoff_time}s for Gemini API quota recovery...")
+        await asyncio.sleep(backoff_time)
 
     if not audio_bytes:
-        raise RuntimeError(f"Failed to generate audio for text: '{clean_text[:30]}...'")
+        raise RuntimeError(f"Gemini TTS Error for: '{clean_text[:35]}...' -> {last_error}")
 
     with wave.open(temp_wav, "wb") as wf:
         wf.setnchannels(1)
@@ -267,30 +252,6 @@ async def synthesize_single_speech(text: str, retries: int = 3) -> str:
         wf.writeframes(audio_bytes)
 
     return temp_wav
-
-async def build_scene_audio(scene_data: dict) -> str:
-    """Builds scene audio: joins suspense parts with silence, then mixes BGM."""
-    if "parts" in scene_data:
-        p1_wav = await synthesize_single_speech(scene_data["parts"][0])
-        silence_wav = create_silence_wav(scene_data.get("pause_duration", 1.8))
-        p2_wav = await synthesize_single_speech(scene_data["parts"][1])
-
-        combined_wav = f"combined_{uuid.uuid4().hex[:8]}.wav"
-        concat_wav_files([p1_wav, silence_wav, p2_wav], combined_wav)
-
-        for temp in [p1_wav, silence_wav, p2_wav]:
-            if temp and os.path.exists(temp):
-                try:
-                    os.remove(temp)
-                except Exception:
-                    pass
-
-        final_wav = await asyncio.to_thread(mix_audio_with_bgm, combined_wav, scene_data["bgm"])
-        return final_wav
-    else:
-        speech_wav = await synthesize_single_speech(scene_data["script"])
-        final_wav = await asyncio.to_thread(mix_audio_with_bgm, speech_wav, scene_data["bgm"])
-        return final_wav
 
 async def play_audio_file(voice_client: discord.VoiceClient, filepath: str):
     """Accurately streams audio file to Discord voice without cutting off."""
@@ -732,7 +693,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
     winner_name = sorted_final[0][0] if sorted_final else "Nobody"
     winner_points = sorted_final[0][1] if sorted_final else 0
 
-    # --- 2. BUILD STRUCTURED SCENES ---
+    # --- 2. BUILD STRUCTURED SCENES (SINGLE-CALL SUSPENSE SCRIPT) ---
     scenes = []
 
     # Scene 1: Intro
@@ -746,7 +707,7 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
         )
     })
 
-    # Scene 2 to N: Each Staff Juror (Suspense pause via clean audio silence)
+    # Scene 2 to N: Each Staff Juror
     for jury_data in poll_data["staff_votes"].values():
         name = jury_data["name"]
         sorted_b = sorted(jury_data["ballot"].items(), key=lambda x: x[1], reverse=True)
@@ -756,11 +717,11 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
             "type": "jury",
             "bgm": "jury",
             "jury_data": jury_data,
-            "parts": [
-                f"We now cross live to our esteemed jury member, {name}. Thank you for your service, {name}. The tension is building in the arena. And {name}'s coveted twelve points go to...",
-                f"Twelve points go to {twelve_pts_candidate}!"
-            ],
-            "pause_duration": 1.8
+            "script": (
+                f"We now cross live to our esteemed jury member, {name}. "
+                f"Thank you for your service, {name}. The tension is building in the arena. "
+                f"And {name}'s coveted twelve points go to... {twelve_pts_candidate}!"
+            )
         })
 
     # Scene N+1: Televote Announcement
@@ -773,25 +734,28 @@ async def start_live_show(interaction: discord.Interaction, poll_id: str, voice_
         )
     })
 
-    # Scene N+2: Grand Winner Coronation (Climax suspense pause via clean silence)
+    # Scene N+2: Grand Winner Coronation
     scenes.append({
         "type": "winner",
         "bgm": "winner",
-        "parts": [
-            f"Ladies and gentlemen, the moment of truth has finally arrived! The final points have been tallied. With an unbelievable total of {winner_points} points, the champion and winner of {poll_data['title']} is...",
-            f"{winner_name}! A massive congratulations to {winner_name}! Thank you all for an unforgettable night, and goodnight!"
-        ],
-        "pause_duration": 2.2
+        "script": (
+            f"Ladies and gentlemen, the moment of truth has finally arrived! "
+            f"The final points have been tallied. "
+            f"With an unbelievable total of {winner_points} points, the champion and winner of {poll_data['title']} is... {winner_name}! "
+            f"A massive congratulations to {winner_name}! Thank you all for an unforgettable night, and goodnight!"
+        )
     })
 
-    # --- 3. PRE-SYNTHESIZE ALL SCENES ---
+    # --- 3. PRE-SYNTHESIZE ALL SCENES (1 CALL PER SCENE + BACKOFF) ---
     try:
         for idx, sc in enumerate(scenes, 1):
             await progress_msg.edit(content=f"🎙️ **Synthesizing Scene {idx}/{len(scenes)} with Achird voice & mixing BGM...**")
-            audio_path = await build_scene_audio(sc)
-            sc["audio_file"] = audio_path
-            # Slight pacing delay to respect API rate limits
-            await asyncio.sleep(0.5)
+            speech_file = await synthesize_achird_speech(sc["script"])
+            mixed_file = await asyncio.to_thread(mix_audio_with_bgm, speech_file, sc["bgm"])
+            sc["audio_file"] = mixed_file
+            
+            # Pacing delay to stay well under Gemini RPM limits
+            await asyncio.sleep(1.2)
 
         # --- 4. SHOW INTERACTIVE START BUTTON ---
         start_view = StartBroadcastView(
